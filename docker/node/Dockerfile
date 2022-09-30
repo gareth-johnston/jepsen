@@ -13,7 +13,9 @@ RUN apt-get -qy update && \
 # Install packages
 RUN apt-get -qy update && \
     apt-get -qy install \
-        dos2unix openssh-server pwgen
+        dos2unix \
+        openssh-server \
+        pwgen
 
 # When run, boot-debian-base will call this script, which does final
 # per-db-node setup stuff.
