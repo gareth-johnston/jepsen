@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+ssh-keyscan -t ssh-ed25519 n1 >> ~/.ssh/known_hosts
+ssh-keyscan -t ssh-ed25519 n2 >> ~/.ssh/known_hosts
+ssh-keyscan -t ssh-ed25519 n3 >> ~/.ssh/known_hosts
+ssh-keyscan -t ssh-ed25519 n4 >> ~/.ssh/known_hosts
+ssh-keyscan -t ssh-ed25519 n5 >> ~/.ssh/known_hosts
+
 tests=("non-reentrant-lock" "reentrant-lock" "non-reentrant-fenced-lock" "reentrant-fenced-lock" "semaphore" "id-gen-long" "cas-long" "cas-reference")
 
 if [ $# -lt 3 ]; then

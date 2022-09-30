@@ -1,6 +1,6 @@
 # See https://github.com/jgoerzen/docker-debian-base
 # See https://hub.docker.com/r/jgoerzen/debian-base-standard
-FROM jgoerzen/debian-base-standard:buster
+FROM jgoerzen/debian-base-standard:bullseye
 
 # I think this is a bug--debian-base-setup crashes because policy-rc.d isn't
 # present in this image, and if you create it, exim crashes... do we actually NEED this? Maybe not...
@@ -13,7 +13,7 @@ RUN apt-get install -y apt-transport-https
 
 # Install packages
 RUN apt-get -qy update && \
-    apt-get -qy install \
+    apt-get -qy install openjdk-17-jdk-headless \
         dos2unix \
         openssh-server \
         pwgen
