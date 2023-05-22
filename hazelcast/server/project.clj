@@ -6,10 +6,10 @@
   :source-paths ["src"]
   :java-source-paths ["java"]
   :dependencies [[org.clojure/clojure "1.11.1"]
-                 [org.clojure/tools.cli "1.0.206"]
+                 [org.clojure/tools.cli "1.0.214"]
                  [org.clojure/tools.logging "1.2.4"]
-                 [spootnik/unilog "0.7.30"]
-                 [com.hazelcast/hazelcast-enterprise "5.2.0-SNAPSHOT"]]
+                 [spootnik/unilog "0.7.31"]
+                 [com.hazelcast/hazelcast-enterprise "5.3.0"]]
   :profiles {:uberjar {:uberjar-name "hazelcast-server.jar"}}
   :main jepsen.hazelcast-server
   :aot [jepsen.hazelcast-server]

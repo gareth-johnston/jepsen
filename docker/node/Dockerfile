@@ -8,11 +8,13 @@ STOPSIGNAL SIGRTMIN+3
 # Basic system stuff
 RUN apt-get -qy update && \
     apt-get -qy install \
+        apt-utils  \
         apt-transport-https
 
 # Install packages
 RUN apt-get -qy update && \
     apt-get -qy install \
+        openjdk-17-jdk-headless \
         dos2unix \
         openssh-server \
         pwgen
