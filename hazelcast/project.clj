@@ -5,7 +5,7 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.11.1"]
                  [jepsen "0.3.2"]
-                 [com.hazelcast/hazelcast-enterprise "5.3.0"]]
+                 [com.hazelcast/hazelcast-enterprise "5.4.0-SNAPSHOT"]]
   :repositories {"hazelcast snapshot" "https://repository.hazelcast.com/snapshot/"
                  "hazelcast release" "https://repository.hazelcast.com/release/"}
   :aot [jepsen.hazelcast]

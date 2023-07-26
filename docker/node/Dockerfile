@@ -21,7 +21,6 @@ RUN apt-get -qy update && \
 # Install packages
 RUN apt-get -qy update && \
     apt-get -qy install \
-        openjdk-17-jdk-headless \
         dos2unix \
         openssh-server \
         pwgen
