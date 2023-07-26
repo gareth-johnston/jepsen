@@ -113,7 +113,7 @@
     (setup! [_ test node]
       (build-server! test node)
       (jepsen/synchronize test)
-      (debian/install [:openjdk-17-jdk-headless])
+      (debian/install [:openjdk-11-jdk-headless])
       (install!)
       (start! test node)
       (Thread/sleep 15000))
