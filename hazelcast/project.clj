@@ -4,7 +4,7 @@
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.11.1"]
-                 [jepsen "0.3.2"]
+                 [jepsen "0.3.4"]
                  [com.hazelcast/hazelcast-enterprise "5.4.0-SNAPSHOT"]]
   :repositories {"hazelcast snapshot" "https://repository.hazelcast.com/snapshot/"
                  "hazelcast release" "https://repository.hazelcast.com/release/"}
