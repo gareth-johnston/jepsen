@@ -6,7 +6,7 @@
   :source-paths ["src"]
   :java-source-paths ["java"]
   :dependencies [[org.clojure/clojure "1.11.1"]
-                 [org.clojure/tools.cli "1.0.214"]
+                 [org.clojure/tools.cli "1.0.219"]
                  [org.clojure/tools.logging "1.2.4"]
                  [spootnik/unilog "0.7.31"]
                  [com.hazelcast/hazelcast-enterprise "5.4.0-SNAPSHOT"]]
