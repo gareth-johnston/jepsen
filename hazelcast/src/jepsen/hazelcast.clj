@@ -169,6 +169,11 @@
   [client name]
   (.getAtomicReference (.getCPSubsystem client) name))
 
+(defn create-cp-map
+  "Creates a new CPMap"
+  [client name]
+  (.getMap (.getCPSubsystem client) name))
+
 
 (defn atomic-long-id-client
   "Generates unique IDs using a CP AtomicLong"
@@ -246,6 +251,38 @@
                    (assoc op :type :ok))
         :cas (let [[currentV newV] (:value op)]
                (if (.compareAndSet atomic-ref currentV newV)
+                 (assoc op :type :ok)
+                 (assoc op :type :fail :error :cas-failed)))))
+
+    (teardown! [this test]
+       (.shutdown conn))
+
+    (close! [this test]
+       (.shutdown conn))
+
+    client/Reusable
+    (reusable? [this test]
+               true)
+  ))
+
+(defn cas-cp-map-client
+  "A CAS register using a CPMap"
+  [conn cp-map]
+  (reify client/Client
+    (open! [_ test node]
+      (let [conn (connect node)]
+        (cas-cp-map-client conn (create-cp-map conn "jepsen.cas-cp-map"))))
+
+    (setup! [this test]
+                 "Called to set up database state for testing.")
+
+    (invoke! [this test op]
+      (case (:f op)
+        :read (assoc op :type :ok, :value (.get cp-map "key"))
+        :write (do (.set cp-map "key" (:value op))
+                   (assoc op :type :ok))
+        :cas (let [[currentV newV] (:value op)]
+               (if (.compareAndSet cp-map "key" currentV newV)
                  (assoc op :type :ok)
                  (assoc op :type :fail :error :cas-failed)))))
 
@@ -693,6 +730,13 @@
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (model/cas-register 0)})}
    :cas-reference             {:client    (cas-reference-client nil nil)
+                               :generator (->> (fn [] (gen/mix [{:type :invoke, :f :read}
+                                                                {:type :invoke, :f :write, :value (rand-int 5)}
+                                                                {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]}]))
+                                               gen/each-thread
+                                               (gen/stagger 0.25))
+                               :checker   (checker/linearizable {:model (model/cas-register 0)})}
+   :cas-cp-map                {:client    (cas-cp-map-client nil nil)
                                :generator (->> (fn [] (gen/mix [{:type :invoke, :f :read}
                                                                 {:type :invoke, :f :write, :value (rand-int 5)}
                                                                 {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]}]))
