@@ -1,6 +1,6 @@
 # jepsen.hazelcast
 
-A Jepsen test suite for Hazelcast IMDG.
+A Jepsen test suite for Hazelcast CP subsystem.
 
 ## How to Use
 
@@ -9,12 +9,12 @@ We run the Jepsen tests using docker containers for convenience.
 First, make sure that Docker is installed. To start Jepsen containers, execute the following command in `jepsen`
 directory which is one level up from `hazelcast` directory:
 
-    $ cd docker && ./up.sh
+    $ cd docker && bin/up
 
 Our Jepsen tests are ready to go once all containers are up and running fine. You can get into the `jepsen-control`
-container by executing the following command:
+container by executing the following command in a new terminal:
 
-    $ docker exec -it jepsen-control bash
+    $  cd docker && bin/console
 
 Then, while you are inside the `jepsen-control` container, run the following command:
 
@@ -25,7 +25,7 @@ While you are at the `hazelcast` directory, you can run our Jepsen tests using `
 
 You can also use the `repeat` scripts to run tests multiple times. For instance, while in the `hazelcast` directory,
 run `sh repeat_single_test.sh non-reentrant-cp-lock 5 120` to run the non-reentrant CP lock test 5 times, each test taking 120
-seconds, or run `sh repeat_all_cp_tests.sh 5 120` to run the whole CP subsystem test suite 5 times, each test taking 120 seconds.
+seconds, or run `sh repeat_all_cp_tests.sh 5 120 <EE_license_key>` to run the whole CP subsystem test suite 5 times, each test taking 120 seconds.
 These scripts stop on a test failure so that you can report and investigate the failure.
 
 ## Test Cases
@@ -67,6 +67,8 @@ clients randomly perform write and compare-and-swap operations.
 
 - Compare-and-swap Register with the new linearizable `IAtomicReference` (`--workload cas-reference`): In this test,
 clients randomly perform write and compare-and-swap operations.
+
+- Compare-and-swap Register with the new linearizable `CPMap` (`--workload cas-cp-map`): In this test, clients randomly perform read, write and compare-and-set operations. We validate the history with the cas-register model of Jepsen.
 
 In each test, multiple clients send concurrent operations to a shared data structure, which is replicated
 to the Hazelcast cluster. In the mean time, Jepsen's `nemesis` injects network partitions into the system. At the end
