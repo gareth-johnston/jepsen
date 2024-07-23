@@ -308,7 +308,7 @@
   queue."
   ([]
    (queue-client nil nil))
-  ([conn queue cp-direct-to-leader-routing]
+  ([conn queue]
    (reify client/Client
      (open! [_ test node]
        (let [conn (connect node)]
