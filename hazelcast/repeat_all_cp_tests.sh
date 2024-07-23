@@ -33,6 +33,7 @@ run_single_test () {
     test_name=$1
     nemesis=$2
     persistent=$3
+    cp_direct_to_leader_routing=$4
     echo "Running '$test_name' test with '$nemesis' nemesis, persistent=$persistent, cp_direct_to_leader_routing=$cp_direct_to_leader_routing"
 
     lein run test --workload "${test_name}" --time-limit "${test_duration}" --license "${license}" --nemesis "${nemesis}" --persistent "${persistent} --cp-direct-to-leader-routing ${cp_direct_to_leader_routing}"
