@@ -17,11 +17,13 @@ fi
 repeat=$1
 test_duration=$2
 license=$3
+cp_direct_to_leader_routing=$4
 
-if [ $# -gt 3 ]; then
+
+if [ $# -gt 4 ]; then
   # Just run specified tests...
   tests=()
-  for i in "${@:4}"
+  for i in "${@:5}"
   do
     tests+=("$i")
   done
@@ -31,9 +33,10 @@ run_single_test () {
     test_name=$1
     nemesis=$2
     persistent=$3
-    echo "Running '$test_name' test with '$nemesis' nemesis, persistent=$persistent"
+    cp_direct_to_leader_routing=$4
+    echo "Running '$test_name' test with '$nemesis' nemesis, persistent=$persistent, cp_direct_to_leader_routing=$cp_direct_to_leader_routing"
 
-    lein run test --workload "${test_name}" --time-limit "${test_duration}" --license "${license}" --nemesis "${nemesis}" --persistent "${persistent}"
+    lein run test --workload "${test_name}" --time-limit "${test_duration}" --license "${license}" --nemesis "${nemesis}" --persistent "${persistent} --cp-direct-to-leader-routing ${cp_direct_to_leader_routing}"
 
     if [ $? != '0' ]; then
         echo "'$test_name' test failed"
@@ -50,9 +53,11 @@ while [ ${round} -le ${repeat} ]; do
 
     for test in "${tests[@]}"
     do
-      run_single_test "${test}" "partition" "false"
-      run_single_test "${test}" "partition" "true"
-      run_single_test "${test}" "restart-majority" "true"
+      run_single_test "${test}" "partition" "false" "false"
+      run_single_test "${test}" "partition" "false" "true"
+      run_single_test "${test}" "partition" "true" "false"
+      run_single_test "${test}" "restart-majority" "true" "false"
+      run_single_test "${test}" "restart-majority" "true" "true"
     done
 
     ((round++))

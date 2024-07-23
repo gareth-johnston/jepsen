@@ -129,7 +129,7 @@
 
 (defn ^HazelcastInstance connect
   "Creates a hazelcast client for the given node."
-  [node]
+  [node cp-direct-to-leader-routing]
   (let [config (ClientConfig.)
         ; Global op timeouts
         _ (.setProperty config "hazelcast.client.heartbeat.interval" "1000")
@@ -138,7 +138,8 @@
         ; The current Jepsen framework version several times instantiates the client
         ; with the same name, which brings to error
 ;        _ (.setInstanceName config node)
-
+        ; Enable or disable CPDirectToLeaderRouting
+        _ (.setCPDirectToLeaderRoutingEnabled config (Boolean/parseBoolean cp-direct-to-leader-routing))
 
         net (doto (.getNetworkConfig config)
               ; Don't retry operations when network fails (!?)
@@ -177,11 +178,11 @@
 
 (defn atomic-long-id-client
   "Generates unique IDs using a CP AtomicLong"
-  [conn atomic-long]
+  [conn atomic-long cp-direct-to-leader-routing]
   (reify client/Client
     (open! [_ test node]
-      (let [conn (connect node)]
-        (atomic-long-id-client conn (create-atomic-long conn "jepsen.atomic-long"))))
+      (let [conn (connect node cp-direct-to-leader-routing)]
+        (atomic-long-id-client conn (create-atomic-long conn "jepsen.atomic-long") cp-direct-to-leader-routing)))
 
     (setup! [this test]
         "Called to set up database state for testing.")
@@ -203,11 +204,11 @@
 
 (defn cas-long-client
   "A CAS register using a CP AtomicLong"
-  [conn atomic-long]
+  [conn atomic-long cp-direct-to-leader-routing]
   (reify client/Client
     (open! [_ test node]
-      (let [conn (connect node)]
-        (cas-long-client conn (create-atomic-long conn "jepsen.cas-long"))))
+      (let [conn (connect node cp-direct-to-leader-routing)]
+        (cas-long-client conn (create-atomic-long conn "jepsen.cas-long") cp-direct-to-leader-routing)))
 
     (setup! [this test]
         "Called to set up database state for testing.")
@@ -235,11 +236,11 @@
 
 (defn cas-reference-client
   "A CAS register using a CP AtomicReference"
-  [conn atomic-ref]
+  [conn atomic-ref cp-direct-to-leader-routing]
   (reify client/Client
     (open! [_ test node]
-      (let [conn (connect node)]
-        (cas-reference-client conn (create-atomic-reference conn "jepsen.cas-register"))))
+      (let [conn (connect node cp-direct-to-leader-routing)]
+        (cas-reference-client conn (create-atomic-reference conn "jepsen.cas-register") cp-direct-to-leader-routing)))
 
     (setup! [this test]
                  "Called to set up database state for testing.")
@@ -267,11 +268,11 @@
 
 (defn cas-cp-map-client
   "A CAS register using a CPMap"
-  [conn cp-map]
+  [conn cp-map cp-direct-to-leader-routing]
   (reify client/Client
     (open! [_ test node]
-      (let [conn (connect node)]
-        (cas-cp-map-client conn (create-cp-map conn "jepsen.cas-cp-map"))))
+      (let [conn (connect node cp-direct-to-leader-routing)]
+        (cas-cp-map-client conn (create-cp-map conn "jepsen.cas-cp-map") cp-direct-to-leader-routing)))
 
     (setup! [this test]
                  "Called to set up database state for testing.")
@@ -373,12 +374,12 @@
       (log-fail clientName op))))
 
 (defn fenced-lock-client
-  ([lock-name] (fenced-lock-client nil nil lock-name))
-  ([conn lock lock-name]
+  ([lock-name cp-direct-to-leader-routing] (fenced-lock-client nil nil lock-name cp-direct-to-leader-routing))
+  ([conn lock lock-name cp-direct-to-leader-routing]
    (reify client/Client
      (open! [_ test node]
-       (let [conn (connect node)]
-         (fenced-lock-client conn (.getLock (.getCPSubsystem conn) lock-name) lock-name)))
+       (let [conn (connect node cp-direct-to-leader-routing)]
+         (fenced-lock-client conn (.getLock (.getCPSubsystem conn) lock-name) lock-name cp-direct-to-leader-routing)))
 
      (setup! [this test]
                   "Called to set up database state for testing.")
@@ -417,14 +418,14 @@
    )))
 
 (defn semaphore-client
-  ([] (semaphore-client nil nil))
-  ([conn semaphore]
+  ([] (semaphore-client nil nil false))
+  ([conn semaphore cp-direct-to-leader-routing]
    (reify client/Client
      (open! [_ test node]
-       (let [conn (connect node)
+       (let [conn (connect node cp-direct-to-leader-routing)
              sem (.getSemaphore (.getCPSubsystem conn) "jepsen.cpSemaphore")
              _ (.init sem num-permits)]
-         (semaphore-client conn sem)))
+         (semaphore-client conn sem cp-direct-to-leader-routing)))
 
      (setup! [this test]
                   "Called to set up database state for testing.")
@@ -471,7 +472,7 @@
 
 (defn map-client
   "Options:
-    :crdt? - If true, use CRDTs for merging divergent maps."
+   :crdt? - If true, use CRDTs for merging divergent maps."
   ([opts] (map-client nil nil opts))
   ([conn m opts]
    (reify client/Client
@@ -482,7 +483,6 @@
                                      crdt-map-name
                                      map-name))
                      opts)))
-
      (invoke! [this test op]
        (case (:f op)
          ; Note that Hazelcast serialization doesn't seem to know how to
@@ -680,16 +680,17 @@
   Note that workloads are *stateful*, since they include generators; that's why
   this is a function, instead of a constant--we may need a fresh workload if we
   run more than one test."
-  [client-uids-to-client-names-map]
+  [client-uids-to-client-names-map opts]
+  (let [cp-direct-to-leader-routing (:cp-direct-to-leader-routing opts)]
   {:crdt-map                  (map-workload {:crdt? true})
    :map                       (map-workload {:crdt? false})
-   :non-reentrant-lock        {:client    (fenced-lock-client "jepsen.cpLock1")
+   :non-reentrant-lock        {:client    (fenced-lock-client "jepsen.cpLock1" cp-direct-to-leader-routing)
                                :generator (->> (fn [] [{:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :release :value (.toString (UUID/randomUUID))}])
                                                gen/each-thread
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (create-owner-aware-mutex client-uids-to-client-names-map)})}
-   :reentrant-lock            {:client    (fenced-lock-client "jepsen.cpLock2")
+   :reentrant-lock            {:client    (fenced-lock-client "jepsen.cpLock2" cp-direct-to-leader-routing)
                                :generator (->> (fn [] [{:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :release :value (.toString (UUID/randomUUID))}
@@ -697,13 +698,13 @@
                                                gen/each-thread
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (create-reentrant-mutex client-uids-to-client-names-map)})}
-   :non-reentrant-fenced-lock {:client    (fenced-lock-client "jepsen.cpLock1")
+   :non-reentrant-fenced-lock {:client    (fenced-lock-client "jepsen.cpLock1" cp-direct-to-leader-routing)
                                :generator (->> (fn [] [{:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :release :value (.toString (UUID/randomUUID))}])
                                                gen/each-thread
                                                (gen/stagger 0.5))
                                :checker   (checker/linearizable {:model (create-fenced-mutex client-uids-to-client-names-map)})}
-   :reentrant-fenced-lock     {:client    (fenced-lock-client "jepsen.cpLock2")
+   :reentrant-fenced-lock     {:client    (fenced-lock-client "jepsen.cpLock2" cp-direct-to-leader-routing)
                                :generator (->> (fn [] [{:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :release :value (.toString (UUID/randomUUID))}
@@ -717,26 +718,26 @@
                                                gen/each-thread
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (create-acquired-permits-model client-uids-to-client-names-map)})}
-   :id-gen-long               {:client    (atomic-long-id-client nil nil)
+   :id-gen-long               {:client    (atomic-long-id-client nil nil cp-direct-to-leader-routing)
                                :generator (->> [{:type :invoke, :f :generate}]
                                                cycle
                                                (gen/stagger 0.25))
                                :checker   (checker/unique-ids)}
-   :cas-long                  {:client    (cas-long-client nil nil)
+   :cas-long                  {:client    (cas-long-client nil nil cp-direct-to-leader-routing)
                                :generator (->> (fn [] (gen/mix [{:type :invoke, :f :read}
                                                                 {:type :invoke, :f :write, :value (rand-int 5)}
                                                                 {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]}]))
                                                gen/each-thread
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (model/cas-register 0)})}
-   :cas-reference             {:client    (cas-reference-client nil nil)
+   :cas-reference             {:client    (cas-reference-client nil nil cp-direct-to-leader-routing)
                                :generator (->> (fn [] (gen/mix [{:type :invoke, :f :read}
                                                                 {:type :invoke, :f :write, :value (rand-int 5)}
                                                                 {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]}]))
                                                gen/each-thread
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (model/cas-register 0)})}
-   :cas-cp-map                {:client    (cas-cp-map-client nil nil)
+   :cas-cp-map                {:client    (cas-cp-map-client nil nil cp-direct-to-leader-routing)
                                :generator (->> (fn [] (gen/mix [{:type :invoke, :f :read}
                                                                 {:type :invoke, :f :write, :value (rand-int 5)}
                                                                 {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]}]))
@@ -744,7 +745,7 @@
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (model/cas-register 0)})}
    :queue                     (assoc (queue-client-and-gens)
-                                :checker (checker/total-queue))})
+                                :checker (checker/total-queue))}))
 
 
 (defn select-majority
@@ -786,7 +787,7 @@
                 client
                 checker
                 model]}
-        (get (workloads client-uids-to-client-names-map) (:workload opts))
+        (get (workloads client-uids-to-client-names-map opts) (:workload opts))
         generator (->> generator
                        (gen/nemesis (start-stop 20 20))
                        (gen/time-limit (:time-limit opts)))
@@ -820,11 +821,12 @@
   "Additional command line options"
   [[nil "--workload WORKLOAD" "Test workload to run, e.g. atomic-long-ids."
     :parse-fn keyword
-    :missing (str "--workload " (cli/one-of (workloads nil)))
-    :validate [(workloads nil) (cli/one-of (workloads nil))]],
+    :missing (str "--workload " (cli/one-of (workloads nil {})))
+    :validate [(workloads nil {}) (cli/one-of (workloads nil {}))]],
    [nil "--nemesis NEMESIS" "Nemesis type, e.g. partition, restart-majority"],
    [nil "--persistent PERSISTENT" "Is persistence enabled?"],
-   [nil "--license LICENSE" "Hazelcast Enterprise License"]])
+   [nil "--license LICENSE" "Hazelcast Enterprise License"],
+   [nil "--cp-direct-to-leader-routing ROUTING" "Enable CP direct to leader routing"]])
 
 (defn -main
   "Command line runner."
