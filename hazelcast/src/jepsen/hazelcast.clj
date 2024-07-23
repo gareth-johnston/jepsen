@@ -306,13 +306,13 @@
 (defn queue-client
   "Uses :enqueue, :dequeue, and :drain events to interact with a Hazelcast
   queue."
-  ([cp-direct-to-leader-routing]
-   (queue-client nil nil cp-direct-to-leader-routing))
+  ([]
+   (queue-client nil nil))
   ([conn queue cp-direct-to-leader-routing]
    (reify client/Client
      (open! [_ test node]
-       (let [conn (connect node cp-direct-to-leader-routing)]
-         (queue-client conn (.getQueue conn "jepsen.queue") cp-direct-to-leader-routing)))
+       (let [conn (connect node)]
+         (queue-client conn (.getQueue conn "jepsen.queue"))))
 
      (invoke! [this test op]
        (case (:f op)
@@ -345,8 +345,8 @@
 (defn queue-client-and-gens
   "Constructs a queue client and generator. Returns {:client
   ..., :generator ...}."
-  [cp-direct-to-leader-routing]
-  {:client          (queue-client cp-direct-to-leader-routing)
+  []
+  {:client          (queue-client)
    :generator       (queue-gen)
    :final-generator (->> {:type :invoke, :f :drain}
                          gen/once
@@ -473,17 +473,16 @@
 (defn map-client
   "Options:
    :crdt? - If true, use CRDTs for merging divergent maps."
-  ([opts cp-direct-to-leader-routing] (map-client nil nil opts cp-direct-to-leader-routing))
-  ([conn m opts cp-direct-to-leader-routing]
+  ([opts] (map-client nil nil opts))
+  ([conn m opts]
    (reify client/Client
      (open! [_ test node]
-       (let [conn (connect node cp-direct-to-leader-routing)]
+       (let [conn (connect node)]
          (map-client conn
                      (.getMap conn (if (:crdt? opts)
                                      crdt-map-name
                                      map-name))
-                     opts
-                     cp-direct-to-leader-routing)))
+                     opts)))
      (invoke! [this test op]
        (case (:f op)
          ; Note that Hazelcast serialization doesn't seem to know how to
@@ -513,8 +512,8 @@
 
 (defn map-workload
   "A workload for map tests, with the given client options."
-  [client-opts cp-direct-to-leader-routing]
-  {:client          (map-client client-opts cp-direct-to-leader-routing)
+  [client-opts]
+  {:client          (map-client client-opts)
    :generator       (->> (range)
                          (map (fn [x] {:type  :invoke
                                        :f     :add
@@ -683,8 +682,8 @@
   run more than one test."
   [client-uids-to-client-names-map opts]
   (let [cp-direct-to-leader-routing (:cp-direct-to-leader-routing opts)]
-  {:crdt-map                  (map-workload {:crdt? true} cp-direct-to-leader-routing)
-   :map                       (map-workload {:crdt? false} cp-direct-to-leader-routing)
+  {:crdt-map                  (map-workload {:crdt? true})
+   :map                       (map-workload {:crdt? false})
    :non-reentrant-lock        {:client    (fenced-lock-client "jepsen.cpLock1" cp-direct-to-leader-routing)
                                :generator (->> (fn [] [{:type :invoke, :f :acquire :value (.toString (UUID/randomUUID))}
                                                        {:type :invoke, :f :release :value (.toString (UUID/randomUUID))}])
@@ -745,7 +744,7 @@
                                                gen/each-thread
                                                (gen/stagger 0.25))
                                :checker   (checker/linearizable {:model (model/cas-register 0)})}
-   :queue                     (assoc (queue-client-and-gens cp-direct-to-leader-routing)
+   :queue                     (assoc (queue-client-and-gens)
                                 :checker (checker/total-queue))}))
 
 
