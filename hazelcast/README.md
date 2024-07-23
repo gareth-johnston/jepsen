@@ -24,7 +24,7 @@ Then, while you are inside the `jepsen-control` container, go to directory with 
 
 While you are at the `hazelcast` directory, you can run our Jepsen tests using `lein`. For instance,
 
-    $ lein run test --workload non-reentrant-cp-lock --time-limit 120 --license <license_key> --nemesis partition --persistent false
+    $ lein run test --workload reentrant-lock --time-limit 120 --license <license_key> --nemesis partition --persistent false --cp-direct-to-leader true
 
 runs the non-reentrant lock test for 120 seconds, with _nemesis_ faults, and without persistence.
 
