@@ -418,7 +418,7 @@
    )))
 
 (defn semaphore-client
-  ([] (semaphore-client nil nil false))
+  ([] (semaphore-client nil nil "false"))
   ([conn semaphore cp-direct-to-leader-routing]
    (reify client/Client
      (open! [_ test node]
