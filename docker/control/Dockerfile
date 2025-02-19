@@ -24,7 +24,7 @@ ENV LEIN_ROOT true
 #
 RUN apt-get -qy update && \
     apt-get -qy install \
-        curl dos2unix emacs git gnuplot graphviz htop iputils-ping libjna-java pssh screen vim wget openjdk-17-jdk-headless
+        curl dos2unix emacs git gnuplot graphviz htop iputils-ping libjna-java openjdk-17-jdk-headless pssh screen vim wget
 
 RUN wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein && \
     mv lein /usr/bin && \
