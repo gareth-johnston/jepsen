@@ -1,6 +1,13 @@
 FROM jgoerzen/debian-base-minimal:bookworm as debian-addons
 FROM debian:bookworm-slim
 
+# When running locally on OSX replace the top lines with following.
+## Force x86_64 for the debian-addons stage
+#FROM --platform=linux/amd64 jgoerzen/debian-base-minimal:bookworm AS debian-addons
+#
+## Force x86_64 for the final stage
+#FROM --platform=linux/amd64 debian:bookworm-slim
+
 COPY --from=debian-addons /usr/local/preinit/ /usr/local/preinit/
 COPY --from=debian-addons /usr/local/bin/ /usr/local/bin/
 COPY --from=debian-addons /usr/local/debian-base-setup/ /usr/local/debian-base-setup/
@@ -17,8 +24,7 @@ ENV LEIN_ROOT true
 #
 RUN apt-get -qy update && \
     apt-get -qy install \
-        curl dos2unix emacs git gnuplot graphviz htop iputils-ping libjna-java pssh screen vim wget && \
-    curl -L https://download.java.net/java/GA/jdk21.0.2/f2283984656d49d69e91c558476027ac/13/GPL/openjdk-21.0.2_linux-x64_bin.tar.gz | tar -xz --strip-components=1 -C /usr/local/
+        curl dos2unix emacs git gnuplot graphviz htop iputils-ping libjna-java pssh screen vim wget openjdk-17-jdk-headless
 
 RUN wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein && \
     mv lein /usr/bin && \
@@ -36,4 +42,4 @@ ADD ./init.sh /init.sh
 RUN dos2unix /init.sh /root/.bashrc \
     && chmod +x /init.sh
 
-CMD /init.sh
+CMD ["/init.sh"]
