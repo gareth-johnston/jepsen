@@ -41,7 +41,12 @@
                     c
                     (ctx/all-threads c))]
     (is (= [:pending {:f :write}]
-           (gen/op {:f :write} {} c))))))
+           (gen/op {:f :write} {} c)))))
+
+  (testing "don't duplicate extmap keys"
+    (let [[op _] (gen/op {:f :write, :foo :bar} {} gen.test/default-context)]
+      (is (instance? jepsen.history.Op op))
+      (is (= {:foo :bar} (.__extmap op))))))
 
 (deftest limit-test
   (is (= [{:type :invoke, :process 0, :time 0, :f :write, :value 1}
@@ -291,7 +296,9 @@
   (is (= [{:type :invoke, :process 0, :time 0, :f :b, :value 2}]
          (->> {:f :a, :value 2}
               (gen/f-map {:a :b})
-              gen.test/perfect))))
+              gen.test/perfect)))
+  (testing "nil passthrough"
+    (is (= nil (gen/f-map {:a :b} nil)))))
 
 (deftest filter-test
   (is (= [0 2 4 6 8]
@@ -581,3 +588,18 @@
                gen/clients
                gen.test/perfect
                (map (juxt (comp long util/nanos->secs :time) :f :value))))))
+
+(deftest single-threaded-test
+  (is (= [[:w :invoke]
+          [:w :ok]
+          [:r :invoke]
+          [:r :ok]
+          [:r :invoke]
+          [:r :ok]]
+         (->> (gen/any (gen/repeat {:f :w})
+                       (gen/repeat {:f :r}))
+              gen/clients
+              (gen/concurrency-limit 1)
+              (gen/limit 3)
+              gen.test/perfect*
+              (map (juxt :f :type))))))

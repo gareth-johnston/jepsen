@@ -1,4 +1,18 @@
-FROM jgoerzen/debian-base-standard:bookworm
+FROM jgoerzen/debian-base-minimal:bookworm as debian-addons
+FROM debian:bookworm-slim
+
+# When running locally on OSX replace the top lines with following.
+## Force x86_64 for the debian-addons stage
+#FROM --platform=linux/amd64 jgoerzen/debian-base-minimal:bookworm AS debian-addons
+#
+## Force x86_64 for the final stage
+#FROM --platform=linux/amd64 debian:bookworm-slim
+
+COPY --from=debian-addons /usr/local/preinit/ /usr/local/preinit/
+COPY --from=debian-addons /usr/local/bin/ /usr/local/bin/
+COPY --from=debian-addons /usr/local/debian-base-setup/ /usr/local/debian-base-setup/
+
+RUN run-parts --exit-on-error --verbose /usr/local/debian-base-setup
 
 ENV container=docker
 STOPSIGNAL SIGRTMIN+3
@@ -28,4 +42,4 @@ ADD ./init.sh /init.sh
 RUN dos2unix /init.sh /root/.bashrc \
     && chmod +x /init.sh
 
-CMD /init.sh
+CMD ["/init.sh"]
