@@ -17,12 +17,16 @@
   :parse-fn (fn [m]
                 (str/split m #"\s*,\s*"))],
  [nil "--persistent PERSISTENT" "Is persistence enabled?"],
- [nil "--license LICENSE" "Hazelcast Enterprise License"]])
+ [nil "--license LICENSE" "Hazelcast Enterprise License"],
+ [nil "--stepDownWhenLeader STEP_DOWN_WHEN_LEADER"
+   "Should this node automatically step down when elected leader?"
+   :parse-fn #(Boolean/parseBoolean %)
+   :default false]])
 
 
 (defn prepare-cp-subsystem-config
   "Prepare Hazelcast CPSubsystemConfig"
-  [config members persistent]
+  [config members persistent step-down?]
   (let [cpSubsystemConfig (.getCPSubsystemConfig config)
         raftAlgorithmConfig (.getRaftAlgorithmConfig cpSubsystemConfig)
         semaphoreConfig (SemaphoreConfig. "jepsen.cpSemaphore" false, 0)
@@ -43,6 +47,7 @@
        (.addSemaphoreConfig cpSubsystemConfig semaphoreConfig)
        (.addLockConfig cpSubsystemConfig lockConfig1)
        (.addLockConfig cpSubsystemConfig lockConfig2)
+       (.setAutoStepDownWhenLeader cpSubsystemConfig step-down?)
        cpSubsystemConfig))
 
 (defn -main
@@ -52,6 +57,7 @@
                 arguments
                 summary
                 errors]} (cli/parse-opts args opt-spec)
+        _ (info "Parsed options:" options)
         config  (Config.)
         members (:members options)
 
@@ -75,7 +81,9 @@
         _       (.setEnabled tcp-ip true)
 
         ; prepare the CP subsystem
-        _ (prepare-cp-subsystem-config config members (:persistent options))
+        _ (prepare-cp-subsystem-config config members
+                                       (:persistent options)
+                                       (:stepDownWhenLeader options))
 
         ; Quorum for split-brain protection
         quorum (doto (SplitBrainProtectionConfig.)
