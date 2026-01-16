@@ -86,18 +86,21 @@
 (defn start!
   "Launch hazelcast server"
   [test node]
-  (c/cd dir
-        (cu/start-daemon!
-          {:chdir dir
-           :logfile log-file
-           :pidfile pid-file}
-          "/usr/bin/java"
-          :-jar jar
-          :--license (:license test)
-          :--persistent (:persistent test)
-          :--members (->> (:nodes test)
-                          (map cn/ip)
-                          (str/join ",")))))
+  (let [step-down? (get (:step-down-when-leader test) node false)]
+    (info "Starting node" node "with stepDownWhenLeader:" step-down?)
+    (c/cd dir
+          (cu/start-daemon!
+           {:chdir   dir
+            :logfile log-file
+            :pidfile pid-file}
+           "/usr/bin/java"
+           :-jar jar
+           :--license (:license test)
+           :--persistent (:persistent test)
+           :--members (->> (:nodes test)
+                           (map cn/ip)
+                           (str/join ","))
+           :--stepDownWhenLeader step-down?))))
 
 (defn stop!
   "Kill hazelcast server"
@@ -782,12 +785,15 @@
   "Constructs a Jepsen test map from CLI options"
   [opts]
   (let [client-uids-to-client-names-map (atom {})
+        ;; Workload info
         {:keys [generator
                 final-generator
                 client
                 checker
                 model]}
         (get (workloads client-uids-to-client-names-map opts) (:workload opts))
+
+        ;; Generator setup
         generator (->> generator
                        (gen/nemesis (start-stop 20 20))
                        (gen/time-limit (:time-limit opts)))
@@ -796,26 +802,45 @@
                     (gen/phases generator
                                 (gen/log "Healing cluster")
                                 (gen/nemesis
-                                  (gen/once {:type :info, :f :stop}))
+                                 (gen/once {:type :info, :f :stop}))
                                 (gen/log "Waiting for quiescence")
                                 (gen/sleep 500)
-                                (gen/clients final-generator)))]
+                                (gen/clients final-generator)))
+
+        ;; StepDownWhenLeader Parsing
+        raw-step-down (:step-down-when-leader opts)
+        step-down-map
+        (cond
+          (or (= raw-step-down "true") (= raw-step-down true))
+          (zipmap nodes (repeat true))
+
+          (or (= raw-step-down "false") (= raw-step-down false))
+          (zipmap nodes (repeat false))
+
+          :else ; assume it's a comma-separated list of node names
+          (let [step-down-set (set (str/split raw-step-down #"\s*,\s*"))]
+            (zipmap nodes (map #(contains? step-down-set %) nodes))))]
+
+    ;; Final test map
     (merge tests/noop-test
            opts
            {:name      (str "hazelcast " (name (:workload opts)))
+            :nodes     nodes
             :os        debian/os
             :db        (db)
             :client    client
             :nemesis   (parse-nemesis (:nemesis opts))
             :generator generator
             :checker   (checker/compose
-                         {:perf     (checker/perf)
-                          :stats    (checker/stats)
-                          :unhandled-exceptions (checker/unhandled-exceptions)
-                          :timeline (timeline/html)
-                          :workload checker})
+                        {:perf     (checker/perf)
+                         :stats    (checker/stats)
+                         :unhandled-exceptions (checker/unhandled-exceptions)
+                         :timeline (timeline/html)
+                         :workload checker})
             :model     model
-            :client-uids-to-client-names client-uids-to-client-names-map})))
+            :client-uids-to-client-names client-uids-to-client-names-map
+            :step-down-when-leader step-down-map})))
+
 
 (def opt-spec
   "Additional command line options"
@@ -826,7 +851,12 @@
    [nil "--nemesis NEMESIS" "Nemesis type, e.g. partition, restart-majority"],
    [nil "--persistent PERSISTENT" "Is persistence enabled?"],
    [nil "--license LICENSE" "Hazelcast Enterprise License"],
-   [nil "--cp-direct-to-leader-routing ROUTING" "Enable CP direct to leader routing"]])
+   [nil "--cp-direct-to-leader-routing CP_DIRECT_TO_LEADER_ROUTING"
+      "Should we use CP direct to leader routing? (true/false)"
+      :default "false"],
+   [nil "--step-down-when-leader STEP_DOWN"
+    "Should this node auto-step down as leader? (true/false or comma-separated IPs)"
+    :default "false"]])
 
 (defn -main
   "Command line runner."

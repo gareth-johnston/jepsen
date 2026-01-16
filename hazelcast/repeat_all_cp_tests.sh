@@ -18,9 +18,10 @@ repeat=$1
 test_duration=$2
 license=$3
 cp_direct_to_leader_routing=$4
+step_down=$5
 
 
-if [ $# -gt 4 ]; then
+if [ $# -gt 5 ]; then
   # Just run specified tests...
   tests=()
   for i in "${@:5}"
@@ -34,9 +35,18 @@ run_single_test () {
     nemesis=$2
     persistent=$3
     cp_direct_to_leader_routing=$4
-    echo "Running '$test_name' test with '$nemesis' nemesis, persistent=$persistent, cp_direct_to_leader_routing=$cp_direct_to_leader_routing"
+    step_down=$5
 
-    lein run test --workload "${test_name}" --time-limit "${test_duration}" --license "${license}" --nemesis "${nemesis}" --persistent "${persistent} --cp-direct-to-leader-routing ${cp_direct_to_leader_routing}"
+    echo "Running '$test_name' test with '$nemesis' nemesis, persistent=$persistent, cp_direct_to_leader_routing=$cp_direct_to_leader_routing, step_down=$step_down"
+
+    lein run test \
+      --workload "${test_name}" \
+      --time-limit "${test_duration}" \
+      --license "${license}" \
+      --nemesis "${nemesis}" \
+      --persistent "${persistent}" \
+      --cp-direct-to-leader-routing "${cp_direct_to_leader_routing}" \
+      --step-down-when-leader "${step_down}"
 
     if [ $? != '0' ]; then
         echo "'$test_name' test failed"
@@ -53,11 +63,21 @@ while [ ${round} -le ${repeat} ]; do
 
     for test in "${tests[@]}"
     do
-      run_single_test "${test}" "partition" "false" "false"
+      run_single_test "${test}" "partition" "false" "false" "false"
+      # abdicating leader
+      run_single_test "${test}" "partition" "false" "false" "n1"
+      # direct routing
       run_single_test "${test}" "partition" "false" "true"
-      run_single_test "${test}" "partition" "true" "false"
+
+      run_single_test "${test}" "partition" "true" "false" "false"
+      # abdicating leader
+      run_single_test "${test}" "partition" "true" "false" "n1"
+
       run_single_test "${test}" "restart-majority" "true" "false"
+      # direct routing
       run_single_test "${test}" "restart-majority" "true" "true"
+      # abdicating leader
+      run_single_test "${test}" "restart-majority" "false" "n1"
     done
 
     ((round++))
