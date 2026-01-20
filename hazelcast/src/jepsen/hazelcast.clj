@@ -132,35 +132,39 @@
 
 (defn ^HazelcastInstance connect
   "Creates a hazelcast client for the given node."
-  [node cp-direct-to-leader-routing]
-  (let [config (ClientConfig.)
-        ; Global op timeouts
-        _ (.setProperty config "hazelcast.client.heartbeat.interval" "1000")
-        _ (.setProperty config "hazelcast.client.heartbeat.timeout" "5000")
-        _ (.setProperty config "hazelcast.client.invocation.timeout.seconds" "5")
-        ; The current Jepsen framework version several times instantiates the client
-        ; with the same name, which brings to error
-;        _ (.setInstanceName config node)
-        ; Enable or disable CPDirectToLeaderRouting
-        _ (.setCPDirectToLeaderRoutingEnabled config (Boolean/parseBoolean cp-direct-to-leader-routing))
+  ;; 1-arg arity for callers that don't care about CP direct-to-leader routing
+  ([node]
+   (connect node "false"))
+  ;; 2-arg arity used by CP tests, controlled via CLI / opts
+  ([node cp-direct-to-leader-routing]
+   (let [config (ClientConfig.)
+         ; Global op timeouts
+         _ (.setProperty config "hazelcast.client.heartbeat.interval" "1000")
+         _ (.setProperty config "hazelcast.client.heartbeat.timeout" "5000")
+         _ (.setProperty config "hazelcast.client.invocation.timeout.seconds" "5")
+         ; The current Jepsen framework version several times instantiates the client
+         ; with the same name, which brings to error
+         ;        _ (.setInstanceName config node)
+         ; Enable or disable CPDirectToLeaderRouting
+         _ (.setCPDirectToLeaderRoutingEnabled config (Boolean/parseBoolean cp-direct-to-leader-routing))
 
-        net (doto (.getNetworkConfig config)
-              ; Don't retry operations when network fails (!?)
-              (.setRedoOperation false)
-              ; Don't use a local cache of the partition map
-              (.setSmartRouting false))
-        _ (info :net net)
+         net (doto (.getNetworkConfig config)
+                   ; Don't retry operations when network fails (!?)
+                   (.setRedoOperation false)
+                   ; Don't use a local cache of the partition map
+                   (.setSmartRouting false))
+         _ (info :net net)
 
-        _ (doto (.getConnectionRetryConfig (.getConnectionStrategyConfig config))
-          ; Try reconnecting indefinitely
-          (.setClusterConnectTimeoutMillis Long/MAX_VALUE))
+         _ (doto (.getConnectionRetryConfig (.getConnectionStrategyConfig config))
+                 ; Try reconnecting indefinitely
+                 (.setClusterConnectTimeoutMillis Long/MAX_VALUE))
 
-        ; Only talk to our node (the client's smart and will try to talk to
-        ; everyone, but we're trying to simulate clients in different network
-        ; components here)
-        ; Connect to our node
-        _ (.addAddress net (into-array String [node]))]
-    (HazelcastClient/newHazelcastClient config)))
+         ; Only talk to our node (the client's smart and will try to talk to
+         ; everyone, but we're trying to simulate clients in different network
+         ; components here)
+         ; Connect to our node
+         _ (.addAddress net (into-array String [node]))]
+     (HazelcastClient/newHazelcastClient config))))
 
 (defn create-atomic-long
   "Creates a new CP based AtomicLong"
@@ -807,39 +811,44 @@
                                 (gen/sleep 500)
                                 (gen/clients final-generator)))
 
-        ;; StepDownWhenLeader Parsing
+        ;; First merge with the noop-test so we get default nodes, etc.
+        base-test (merge tests/noop-test opts)
+        nodes     (:nodes base-test)
+
+        ;; StepDownWhenLeader parsing from CLI
         raw-step-down (:step-down-when-leader opts)
         step-down-map
         (cond
+          ;; every node steps down
           (or (= raw-step-down "true") (= raw-step-down true))
           (zipmap nodes (repeat true))
 
-          (or (= raw-step-down "false") (= raw-step-down false))
+          ;; no node steps down (also cover nil just in case)
+          (or (= raw-step-down "false") (= raw-step-down false) (nil? raw-step-down))
           (zipmap nodes (repeat false))
 
-          :else ; assume it's a comma-separated list of node names
+          ;; per-node list: "n1,n3" etc.
+          :else
           (let [step-down-set (set (str/split raw-step-down #"\s*,\s*"))]
             (zipmap nodes (map #(contains? step-down-set %) nodes))))]
 
     ;; Final test map
-    (merge tests/noop-test
-           opts
+    (merge base-test
            {:name      (str "hazelcast " (name (:workload opts)))
-            :nodes     nodes
             :os        debian/os
             :db        (db)
             :client    client
             :nemesis   (parse-nemesis (:nemesis opts))
             :generator generator
             :checker   (checker/compose
-                        {:perf     (checker/perf)
-                         :stats    (checker/stats)
-                         :unhandled-exceptions (checker/unhandled-exceptions)
-                         :timeline (timeline/html)
-                         :workload checker})
+                        {:perf                  (checker/perf)
+                         :stats                 (checker/stats)
+                         :unhandled-exceptions  (checker/unhandled-exceptions)
+                         :timeline              (timeline/html)
+                         :workload              checker})
             :model     model
             :client-uids-to-client-names client-uids-to-client-names-map
-            :step-down-when-leader step-down-map})))
+            :step-down-when-leader       step-down-map})))
 
 
 (def opt-spec
