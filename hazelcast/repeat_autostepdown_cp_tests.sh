@@ -57,14 +57,14 @@ run_single_test () {
 
 round=1
 echo "Will run tests: [${tests[*]}]"
-echo "Each scenario: time-limit=${test_duration}s, step-down-when-leader=n1 (always)"
+echo "Each scenario: time-limit=${test_duration}s, step-down-when-leader=n1,n2 (always)"
 
 while [ "${round}" -le "${repeat}" ]; do
     echo "=== round: ${round} ==="
 
     for test in "${tests[@]}"; do
-      # Always have an auto-step-down leader (n1)
-      step_down="n1"
+      # Always have two auto-step-down leaders (n1 and n2)
+      step_down="n1,n2"
 
       # Keep the matrix modest so total fits in ~6h for long durations.
       # 1) partition, non-persistent
