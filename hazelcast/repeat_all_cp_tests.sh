@@ -9,23 +9,19 @@ ssh-keyscan -t ssh-ed25519 n5 >> ~/.ssh/known_hosts
 tests=("non-reentrant-lock" "reentrant-lock" "non-reentrant-fenced-lock" "reentrant-fenced-lock" "semaphore" "id-gen-long" "cas-long" "cas-reference" "cas-cp-map")
 
 if [ $# -lt 3 ]; then
-	echo "Usage: ./repeat_all_cp_tests.sh repeat test_duration license [tests...]"
-	echo "Tests: ${tests[*]}"
-	exit 1
+  echo "Usage: ./repeat_all_cp_tests.sh repeat test_duration license [tests...]"
+  echo "Tests: ${tests[*]}"
+  exit 1
 fi
 
 repeat=$1
 test_duration=$2
 license=$3
-cp_direct_to_leader_routing=$4
-step_down=$5
 
-
-if [ $# -gt 5 ]; then
-  # Just run specified tests...
+# If extra args are given, treat them as the list of tests to run
+if [ $# -gt 3 ]; then
   tests=()
-  for i in "${@:5}"
-  do
+  for i in "${@:4}"; do
     tests+=("$i")
   done
 fi
@@ -48,7 +44,7 @@ run_single_test () {
       --cp-direct-to-leader-routing "${cp_direct_to_leader_routing}" \
       --step-down-when-leader "${step_down}"
 
-    if [ $? != '0' ]; then
+    if [ $? != 0 ]; then
         echo "'$test_name' test failed"
         exit 1
     fi
@@ -57,29 +53,26 @@ run_single_test () {
 round=1
 echo "Will run [${tests[*]}] tests..."
 
-while [ ${round} -le ${repeat} ]; do
+while [ "${round}" -le "${repeat}" ]; do
 
     echo "round: $round"
 
-    for test in "${tests[@]}"
-    do
-      run_single_test "${test}" "partition" "false" "false" "false"
-      # abdicating leader
-      run_single_test "${test}" "partition" "false" "false" "n1"
-      # direct routing
-      run_single_test "${test}" "partition" "false" "true"
+    for test in "${tests[@]}"; do
+      # partition, non-persistent
+      run_single_test "${test}" "partition" "false" "false" "false"  # baseline
+      run_single_test "${test}" "partition" "false" "false" "n1"    # abdicating leader (only n1)
+      run_single_test "${test}" "partition" "false" "true"  "false" # direct routing, no abdication
 
-      run_single_test "${test}" "partition" "true" "false" "false"
-      # abdicating leader
-      run_single_test "${test}" "partition" "true" "false" "n1"
+      # partition, persistent
+      run_single_test "${test}" "partition" "true"  "false" "false" # baseline
+      run_single_test "${test}" "partition" "true"  "false" "n1"    # abdicating leader (only n1)
 
-      run_single_test "${test}" "restart-majority" "true" "false"
-      # direct routing
-      run_single_test "${test}" "restart-majority" "true" "true"
-      # abdicating leader
-      run_single_test "${test}" "restart-majority" "false" "n1"
+      # restart-majority, persistent
+      run_single_test "${test}" "restart-majority" "true"  "false" "false" # baseline
+      run_single_test "${test}" "restart-majority" "true"  "true"  "false" # direct routing, no abdication
+      # restart-majority, non-persistent, abdicating leader
+      run_single_test "${test}" "restart-majority" "false" "false" "n1"
     done
 
     ((round++))
-
 done
