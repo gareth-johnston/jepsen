@@ -1,26 +1,31 @@
 (ns jepsen.util
   "Kitchen sink"
   (:refer-clojure :exclude [parse-long]) ; Clojure added this in 1.11.1
-  (:require [clojure.tools.logging :refer [info]]
+  (:require [clj-time.core :as time]
+            [clj-time.local :as time.local]
+            [clojure [string :as str]
+                     [pprint :as pprint :refer [pprint]]
+                     [walk :as walk]]
             [clojure.core.reducers :as r]
-            [clojure [string :as str]]
-            [clojure.pprint :refer [pprint]]
-            [clojure.walk :as walk]
+            [clojure.data.generators :as dg]
             [clojure.java [io :as io]
                           [shell :as shell]]
-            [clj-time.core :as time]
-            [clj-time.local :as time.local]
             [clojure.tools.logging :refer [debug info warn]]
-            [dom-top.core :as dt :refer [bounded-future]]
+            [dom-top.core :as dt :refer [loopr bounded-future]]
             [fipp [edn :as fipp]
+                  [ednize]
                   [engine :as fipp.engine]]
-            [knossos.history :as history]
-            [slingshot.slingshot :refer [try+ throw+]])
+            [jepsen [history :as h]]
+            [jepsen.history.fold :refer [loopf]]
+            [potemkin :refer [definterface+]]
+            [slingshot.slingshot :refer [try+ throw+]]
+            [tesser.core :as t])
   (:import (java.lang.reflect Method)
            (java.util.concurrent.locks LockSupport)
            (java.util.concurrent ExecutionException)
            (java.io File
-                    RandomAccessFile)))
+                    RandomAccessFile)
+           (jepsen.history Op)))
 
 
 (defn default
@@ -85,7 +90,13 @@
 (defn majority
   "Given a number, returns the smallest integer strictly greater than half."
   [n]
-  (inc (int (Math/floor (/ n 2)))))
+  (inc (long (Math/floor (/ n 2)))))
+
+(defn minority
+  "Given a number, returns the largest integer strictly less than half. Minimum
+  0."
+  [n]
+  (max 0 (dec (long (Math/ceil (/ n 2))))))
 
 (defn minority-third
   "Given a number, returns the largest integer strictly less than 1/3rd.
@@ -93,27 +104,68 @@
   [n]
   (-> n dec (/ 3) long))
 
+(defn partition-by-vec
+  "A faster version of partition-by which returns a vector of vectors, rather
+  than using lazy seqs. Comes at the cost of eager evaluation."
+  [f xs]
+  (if (seq xs)
+    (loopr [fx     ::init  ; (f x)
+            chunks (transient [])
+            chunk  (transient [])]
+           [x' xs]
+           (let [fx' (f x')]
+             (cond ; Same chunk
+                   (= fx fx')
+                   (recur fx chunks (conj! chunk x'))
+
+                   ; New chunk. First element?
+                   (identical? ::init fx)
+                   (recur fx' chunks (conj! chunk x'))
+
+                   ; New chunk, later element
+                   true
+                   (recur fx'
+                          (conj! chunks (persistent! chunk))
+                          (transient [x']))))
+           ; Done; fold in last chunk
+           (let [chunk (persistent! chunk)]
+             (persistent!
+               (if (= 0 (count chunk))
+                 chunks
+                 (conj! chunks chunk)))))
+    []))
+
+(defn extreme-by*
+  "Helper for min-by and max-by"
+  [f coll retain?]
+  (loopr [x  nil
+          fx ::init]
+         [x' coll]
+         (let [fx' (f x')]
+           (cond ; First round
+                 (identical? fx ::init)
+                 (recur x' fx')
+
+                 ; x' bigger
+                 (retain? (compare fx fx'))
+                 (recur x' fx')
+
+                 ; Keep looking
+                 true
+                 (recur x fx)))
+         x))
+
 (defn min-by
   "Finds the minimum element of a collection based on some (f element), which
   returns Comparables. If `coll` is empty, returns nil."
   [f coll]
-  (when (seq coll)
-    (reduce (fn [m e]
-              (if (pos? (compare (f m) (f e)))
-                e
-                m))
-            coll)))
+  (extreme-by* f coll pos?))
 
 (defn max-by
   "Finds the maximum element of a collection based on some (f element), which
   returns Comparables. If `coll` is empty, returns nil."
   [f coll]
-  (when (seq coll)
-    (reduce (fn [m e]
-              (if (neg? (compare (f m) (f e)))
-                e
-                m))
-            coll)))
+  (extreme-by* f coll neg?))
 
 (defn fast-last
   "Like last, but O(1) on counted collections."
@@ -131,6 +183,105 @@
   lambda."
   [lambda]
   (* (Math/log (- 1 (rand))) (- lambda)))
+
+(defn zipf-b-inverse-cdf
+  "Inverse cumulative distribution function for the zipfian bounding function
+  used in `zipf`."
+  (^double [^double skew ^double t ^double p]
+           (let [tp (* t p)]
+             (if (<= tp 1)
+               ; Clamp so we don't fly off to infinity
+               tp
+               (Math/pow (+ (* tp (- 1 skew))
+                            skew)
+                         (/ (- 1 skew)))))))
+
+(def zipf-default-skew
+  "When we choose zipf-distributed things, what skew do we generally pick?"
+  1.0001)
+
+(defn zipf
+  "Selects a Zipfian-distributed integer in [0, n) with a given skew
+  factor. Adapted from the rejection sampling technique in
+  https://jasoncrease.medium.com/rejection-sampling-the-zipf-distribution-6b359792cffa."
+  ([^long n]
+   (zipf zipf-default-skew n))
+  ([^double skew ^long n]
+   (if (= n 0)
+     0
+     (do (assert (not= 1.0 skew)
+                 "Sorry, our approximation can't do skew = 1.0! Try a small epsilon, like 1.0001")
+         (let [t (/ (- (Math/pow n (- 1 skew)) skew)
+                    (- 1 skew))]
+           (loop []
+             (let [inv-b         (zipf-b-inverse-cdf skew t (dg/double))
+                   sample-x      (long (+ 1 inv-b))
+                   y-rand        (dg/double)
+                   ratio-top     (Math/pow sample-x (- skew))
+                   ratio-bottom  (/ (if (<= sample-x 1)
+                                      1
+                                      (Math/pow inv-b (- skew)))
+                                    t)
+                   rat (/ ratio-top (* t ratio-bottom))]
+               (if (< y-rand rat)
+                 (dec sample-x)
+                 (recur)))))))))
+
+(defn rand-distribution
+  "Generates a random value with a distribution (default `:uniform`) of:
+
+  ```clj
+  ; Uniform distribution from min (inclusive, default 0) to max (exclusive,
+  ; default Long/MAX_VALUE).
+  {:distribution :uniform, :min 0, :max 1024}
+
+  ; Geometric distribution with mean 1/p.
+  {:distribution :geometric, :p 1e-3}
+
+  ; Zipfian integer in [0, n) with skew s (default ~1)
+  {:distribution :zipf, :n 10, :skew 1.5}
+
+  ; Select a value from a sequence with equal probability.
+  {:distribution :one-of, :values [-1, 4097, 1e+6]}
+
+  ; Select a value based on weights. :weights are {value weight ...}
+  {:distribution :weighted :weights {1e-3 1 1e-4 3 1e-5 1}}
+  ```"
+  ([] (rand-distribution {}))
+  ([distribution-map]
+   (let [{:keys [distribution min max p n skew values weights]} distribution-map
+         distribution (or distribution :uniform)
+         min (or min 0)
+         max (or max Long/MAX_VALUE)
+         _   (assert (case distribution
+                       :uniform   (< min max)
+                       :geometric (number? p)
+                       :zipf      (and (integer? n)
+                                       (or (nil? skew) (number? skew)))
+                       :one-of    (seq values)
+                       :weighted  (and (map? weights)
+                                       (->> weights
+                                            vals
+                                            (every? number?)))
+                       false)
+                     (str "Invalid distribution-map: " distribution-map))]
+     (case distribution
+       :uniform   (long (Math/floor (+ min (* (rand) (- max min)))))
+       :geometric (long (Math/ceil  (/ (Math/log (rand))
+                                       (Math/log (- 1.0 p)))))
+       :zipf      (if skew
+                    (zipf skew n)
+                    (zipf n))
+       :one-of    (rand-nth values)
+       :weighted  (let [values  (keys weights)
+                        weights (reductions + (vals weights))
+                        total   (last weights)
+                        choices (map vector values weights)]
+                    (let [choice (rand-int total)]
+                      (loop [[[v w] & more] choices]
+                        (if (< choice w)
+                          v
+                          (recur more)))))))))
 
 (defn fraction
   "a/b, but if b is zero, returns unity."
@@ -223,24 +374,27 @@
   ([f history]
     (pwrite-history! f prn-op history))
   ([f printer history]
-   (if (or (< (count history) 16384) (not (vector? history)))
-     ; Plain old write
-     (write-history! f printer history)
-     ; Parallel variant
-     (let [chunks (chunk-vec (Math/ceil (/ (count history) (processors)))
-                             history)
-           files  (repeatedly (count chunks)
-                              #(File/createTempFile "jepsen-history" ".part"))]
-       (try
-         (->> chunks
-              (map (fn [file chunk]
-                     (bounded-future (write-history! file printer chunk) file))
-                   files)
-              doall
-              (map deref)
-              (concat-files! f))
-         (finally
-           (doseq [f files] (.delete ^File f))))))))
+   (h/fold history
+           (loopf {:name [:pwrite-history (str printer)]}
+                  ; Reduce
+                  ([file   (File/createTempFile "jepsen-history" ".part")
+                    writer (io/writer file)]
+                   [op]
+                   (do (binding [*out*              writer
+                                 *flush-on-newline* false]
+                         (printer op))
+                       (recur file writer))
+                   (do (.flush ^java.io.Writer writer)
+                       (.close ^java.io.Writer writer)
+                       file))
+                  ; Combine
+                  ([files []]
+                   [file]
+                   (recur (conj files file))
+                   (try (concat-files! f files)
+                        f
+                        (finally
+                          (doseq [^File f files] (.delete f)))))))))
 
 (defn log-op
   "Logs an operation and returns it."
@@ -401,7 +555,7 @@
    (await-fn f {}))
   ([f opts]
    (let [log-message    (:log-message opts (str "Waiting for " f "..."))
-         retry-interval (:retry-interval opts 1000)
+         retry-interval (long (:retry-interval opts 1000))
          log-interval   (:log-interval opts retry-interval)
          timeout        (:timeout opts 60000)
          t0             (linear-time-nanos)
@@ -705,41 +859,31 @@
         (sequential? thing-or-things) thing-or-things
         true                          (list thing-or-things)))
 
+(defn nil-if-empty
+  "Takes a seqable and returns it, or nil if (seq seqable) is nil. Helpful when
+  you want to return a vector if non-empty, or nil otherwise."
+  [seqable]
+  (if (nil? (seq seqable))
+    nil
+    seqable))
+
 (defn history->latencies
-  "Takes a history--a sequence of operations--and emits the same history but
-  with every invocation containing two new keys:
+  "Takes a history--a sequence of operations--and returns a new history where
+  operations have two new keys:
 
   :latency    the time in nanoseconds it took for the operation to complete.
   :completion the next event for that process"
   [history]
-  (let [idx (->> history
-                 (map-indexed (fn [i op] [op i]))
-                 (into {}))]
-    (->> history
-         (reduce (fn [[history invokes] op]
-                   (if (= :invoke (:type op))
-                     ; New invocation!
-                     [(conj! history op)
-                      (assoc! invokes (:process op)
-                              (dec (count history)))]
-
-                     (if-let [invoke-idx (get invokes (:process op))]
-                       ; We have an invocation for this process
-                       (let [invoke (get history invoke-idx)
-                             ; Compute latency
-                             l    (- (:time op) (:time invoke))
-                             op (assoc op :latency l)]
-                         [(-> history
-                              (assoc! invoke-idx
-                                      (assoc invoke :latency l, :completion op))
-                              (conj! op))
-                          (dissoc! invokes (:process op))])
-
-                       ; We have no invocation for this process
-                       [(conj! history op) invokes])))
-                 [(transient []) (transient {})])
-         first
-         persistent!)))
+  (h/ensure-pair-index history)
+  (h/map (fn add-latency [^Op op]
+           (if (h/invoke? op)
+             (if-let [^Op c (h/completion history op)]
+               (assoc op
+                      :completion c
+                      :latency (- (.time c) (.time op)))
+               op)
+             op))
+         history))
 
 (defn nemesis-intervals
   "Given a history where a nemesis goes through :f :start and :f :stop type
@@ -991,3 +1135,63 @@
 
          true
          nil)))
+
+(definterface+ IForgettable
+  (forget! [this]
+           "Allows this forgettable reference to be reclaimed by the GC at some
+           later time. Future attempts to dereference it may throw. Returns
+           self."))
+
+(deftype Forgettable [^:unsynchronized-mutable x]
+  IForgettable
+  (forget! [this]
+    (set! x ::forgotten)
+    this)
+
+  clojure.lang.IDeref
+  (deref [this]
+    (let [x x]
+      (if (identical? x ::forgotten)
+        (throw+ {:type ::forgotten})
+        x)))
+
+  Object
+  (toString [this]
+    (let [x x]
+      (str "#<Forgettable " (if (identical? x ::forgotten)
+                              "?"
+                              x)
+           ">")))
+
+  (equals [this other]
+    (identical? this other)))
+
+(defn forgettable
+  "Constructs a deref-able reference to x which can be explicitly forgotten.
+  Helpful for controlling access to infinite seqs (e.g. the generator) when you
+  don't have firm control over everyone who might see them."
+  [x]
+  (Forgettable. x))
+
+(defmethod pprint/simple-dispatch jepsen.util.Forgettable
+  [^Forgettable f]
+  (let [prefix (format "#<Forgettable ")]
+    (pprint/pprint-logical-block
+      :prefix prefix :suffix ">"
+      (pprint/pprint-indent :block (-> (count prefix) (- 2) -))
+      (pprint/pprint-newline :linear)
+      (pprint/write-out (try+ @f
+                              (catch [:type ::forgotten] e
+                                "?"))))))
+
+(prefer-method pprint/simple-dispatch
+               jepsen.util.Forgettable clojure.lang.IDeref)
+
+(extend-protocol fipp.ednize/IOverride jepsen.util.Forgettable)
+(extend-protocol fipp.ednize/IEdn jepsen.util.Forgettable
+  (-edn [f]
+    (fipp.ednize/tagged-object f
+                               (try+ @f
+                                     (catch [:type ::forgotten] e
+                                       '?)))))
+

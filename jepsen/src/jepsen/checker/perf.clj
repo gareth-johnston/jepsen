@@ -6,14 +6,15 @@
             [clojure.set :as set]
             [clojure.java.io :as io]
             [clojure.tools.logging :refer [info warn]]
-            [jepsen.util :as util]
-            [jepsen.store :as store]
-            [multiset.core :as multiset]
             [gnuplot.core :as g]
-            [knossos.core :as knossos]
-            [knossos.op :as op]
-            [knossos.history :as history]
-            [slingshot.slingshot :refer [try+ throw+]]))
+            [jepsen [history :as h]
+                    [store :as store]
+                    [util :as util]]
+            [jepsen.history.fold :as f]
+            [multiset.core :as multiset]
+            [slingshot.slingshot :refer [try+ throw+]]
+            [tesser.core :as t])
+  (:import (jepsen.history Op)))
 
 (def default-nemesis-color "#cccccc")
 (def nemesis-alpha 0.6)
@@ -94,33 +95,41 @@
 
 (defn invokes-by-type
   "Splits up a sequence of invocations into ok, failed, and crashed ops by
-  looking at their corresponding completions."
-  [ops]
-  {:ok   (filter #(= :ok   (:type (:completion %))) ops)
-   :fail (filter #(= :fail (:type (:completion %))) ops)
-   :info (filter #(= :info (:type (:completion %))) ops)})
+  looking at their corresponding completions. Either a tesser fold, or runs on
+  a history."
+  ([]
+   (->> (t/filter h/invoke?)
+        (t/fuse {:ok   (t/into [] (t/filter (comp h/ok?   :completion)))
+                 :info (t/into [] (t/filter (comp h/info? :completion)))
+                 :fail (t/into [] (t/filter (comp h/fail? :completion)))})))
+  ([history]
+   (h/tesser history (invokes-by-type))))
 
 (defn invokes-by-f
-  "Takes a history and returns a map of f -> ops, for all invocations."
-  [history]
-  (->> history
-       (filter op/invoke?)
-       (group-by :f)))
+  "Takes a history and returns a map of f -> ops, for all invocations. Either a
+  tesswer fold, or runs on a history."
+  ([]
+   (->> (t/filter h/invoke?)
+        (t/group-by :f)
+        (t/into [])))
+  ([history]
+   (h/tesser history (invokes-by-f))))
 
 (defn invokes-by-f-type
-  "Takes a history and returns a map of f -> type -> ops, for all invocations."
-  [history]
-  (->> history
-       (filter op/invoke?)
-       (group-by :f)
-       (util/map-kv (fn [[f ops]] [f (invokes-by-type ops)]))))
+  "A fold which returns a map of f -> type -> ops, for all invocations."
+  ([]
+   (into (->> (t/filter h/invoke?)
+              (t/group-by :f))
+         (invokes-by-type)))
+  ([history]
+   (h/tesser history (invokes-by-f-type))))
 
 (defn completions-by-f-type
   "Takes a history and returns a map of f -> type-> ops, for all completions in
   history."
   [history]
   (->> history
-       (remove op/invoke?)
+       (h/remove h/invoke?)
        (group-by :f)
        (util/map-kv (fn [[f ops]] [f (group-by :type ops)]))))
 
@@ -129,7 +138,7 @@
   each level."
   [history]
   (->> history
-       (r/remove op/invoke?)
+       (h/remove h/invoke?)
        (reduce (fn [m op]
                  (let [f (:f op)
                        t (:type op)]
@@ -186,7 +195,7 @@
   operations in the history into different nemeses, as per the spec. Returns
   the nemesis spec, restricted to just those nemeses taking part in this
   history, and with each spec augmented with an :ops key, which contains all
-  operations that nemesis performed."
+  operations that nemesis performed. Skips :hidden? nemeses."
   [nemeses history]
   ; Build an index mapping :fs to nemeses.
   ; TODO: verify no nemesis fs overlap
@@ -212,14 +221,16 @@
         nemeses (if-let [ops (ops-by-nemesis nil)]
                   (conj nemeses {:name "nemesis"
                                  :ops  ops})
-                  nemeses)]
+                  nemeses)
+        ; Skip hidden nemeses
+        nemeses (remove :hidden? nemeses)]
     nemeses))
 
 (defn nemesis-activity
   "Given a nemesis specification and a history, partitions the set of nemesis
   operations in the history into different nemeses, as per the spec. Returns
-  the spec, restricted to just those nemeses taking part in this history, and
-  with each spec augmented with two keys:
+  the spec, restricted to just those non-hidden nemeses taking part in this
+  history, and with each spec augmented with two keys:
 
     :ops        All operations the nemeses performed
     :intervals  A set of [start end] paired ops."
@@ -311,11 +322,12 @@
   "Augments a plot map to render nemesis activity. Takes a nemesis
   specification: a collection of nemesis spec maps, each of which has keys:
 
-    :name   A string uniquely naming this nemesis
-    :color  What color to use for drawing this nemesis (e.g. \"#abcd01\")
-    :start  A set of :f's which begin this nemesis' activity
-    :stop   A set of :f's which end this nemesis' activity
-    :fs     A set of :f's otherwise related to this nemesis"
+    :name     A string uniquely naming this nemesis
+    :color    What color to use for drawing this nemesis (e.g. \"#abcd01\")
+    :start    A set of :f's which begin this nemesis' activity
+    :stop     A set of :f's which end this nemesis' activity
+    :fs       A set of :f's otherwise related to this nemesis
+    :hidden?  Skips rendering this nemesis."
   [plot history nemeses]
   (let [nemeses (nemesis-activity nemeses history)]
     (-> plot
@@ -374,7 +386,9 @@
   (let [data    (mapcat :data (:series plot))
         _       (when-not (seq data)
                   (throw+ {:type ::no-points
-                           :plot plot}))
+                           :plot plot}
+                          nil
+                          "No points in plot"))
         [x0 y0] (first data)
         [xmin xmax ymin ymax] (reduce (fn [[xmin xmax ymin ymax] [x y :as pair]]
                                              [(min xmin x)
@@ -482,16 +496,21 @@
              (throw (IllegalStateException. "Error rendering plot, verify gnuplot is installed and reachable" e)))))))
 
 (defn point-graph!
-  "Writes a plot of raw latency data points."
-  [test history {:keys [subdirectory nemeses] :as opts}]
+  "Writes a plot of raw latency data points. Options:
+
+    :subdirectory     The directory inside the test dir to put plots in.
+    :filename         The name of the file in that subdirectory.
+    :nemeses          Information about how to render nemesis operations."
+  [test history {:keys [subdirectory filename nemeses] :as opts}]
   (let [nemeses     (or nemeses (:nemeses (:plot test)))
+        filename    (or filename "latency-raw.png")
         history     (util/history->latencies history)
         datasets    (invokes-by-f-type history)
         fs          (util/polysort (keys datasets))
         fs->points- (fs->points fs)
         output-path (.getCanonicalPath (store/path! test
                                                     subdirectory
-                                                    "latency-raw.png"))
+                                                    filename))
         preamble    (latency-preamble test output-path)
         series      (->> (for [f fs, t types]
                            (when-let [data (seq (get-in datasets [f t]))]
@@ -562,35 +581,51 @@
   (let [nemeses     (or nemeses (:nemeses (:plot test)))
         dt          10
         td          (double (/ dt))
-        t-max       (->> history (r/map :time) (reduce max 0) util/nanos->secs)
-        datasets    (->> history
-                         (r/remove op/invoke?)
-                         ; Don't graph nemeses
-                         (r/filter (comp integer? :process))
-                         ; Compute rates
-                         (reduce (fn [m op]
-                                   (update-in m [(:f op)
-                                                 (:type op)
-                                                 (bucket-time dt
-                                                              (util/nanos->secs
-                                                               (:time op)))]
-                                              #(+ td (or % 0))))
-                                 {}))
+        ; Times might technically be out-of-order (and our tests do this
+        ; intentionally, just for convenience)
+        t-max       (h/task history max-time []
+                            (let [t (->> (t/map :time)
+                                         (t/max)
+                                         (h/tesser history))]
+                              (util/nanos->secs (or t 0))))
+        ; Compute rates: a map of f -> type -> time-bucket -> rate
+        datasets
+        (h/fold
+          (->> history
+               (h/remove h/invoke?)
+               h/client-ops)
+          (f/loopf {:name :rate-graph}
+                   ; We work with a flat map for speed, and nest it at
+                   ; the end
+                   ([m (transient {})]
+                    [^Op op]
+                    (recur (let [bucket (bucket-time dt (util/nanos->secs
+                                                          (.time op)))
+                                 k [(.f op) (.type op) bucket]]
+                             (assoc! m k (+ (get m k 0) td))))
+                    (persistent! m))
+                   ; Combiner: merge, then furl
+                   ([m {}]
+                    [m2]
+                    (recur (merge-with + m m2))
+                    (reduce (fn unfurl [nested [ks rate]]
+                              (assoc-in nested ks rate))
+                            {}
+                            m))))
         fs          (util/polysort (keys datasets))
         fs->points- (fs->points fs)
-        output-path (.getCanonicalPath (store/path! test
-                                                    subdirectory
-                                                    "rate.png"))
-
+        output-path (.getCanonicalPath
+                      (store/path! test subdirectory "rate.png"))
         preamble (rate-preamble test output-path)
-        series   (for [f fs, t types]
-                   {:title     (str (util/name+ f) " " (name t))
-                    :with      'linespoints
-                    :linetype  (type->color t)
-                    :pointtype (fs->points- f)
-                    :data      (let [m (get-in datasets [f t])]
-                                 (map (juxt identity #(get m % 0))
-                                      (buckets dt t-max)))})]
+        series   (->> (for [f fs, t types]
+                        (when-let [data (get-in datasets [f t])]
+                          {:title     (str (util/name+ f) " " (name t))
+                           :with      'linespoints
+                           :linetype  (type->color t)
+                           :pointtype (fs->points- f)
+                           :data      (map (juxt identity #(get data % 0))
+                                           (buckets dt @t-max))}))
+                      (remove nil?))]
     (-> {:preamble  preamble
          :series    series}
         (with-range)

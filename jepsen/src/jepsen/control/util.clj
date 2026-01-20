@@ -26,14 +26,17 @@
      (fn check-port []
        (exec :nc :-z :localhost port)
        nil)
-     (merge {:log-message "Waiting for port " port " ..."}
+     (merge {:log-message (str "Waiting for port " port " ...")}
             opts))))
 
 (defn file?
+  "Is `filename` a regular file that exists?"
   [filename]
-  (throw (RuntimeException. "Use exists? instead; file? will be used to tell if
-                            something is a file, as opposed to a directory or
-                            link.")))
+  (try+
+   (exec :test :-f filename)
+   true
+   (catch [:exit 1] _
+     false)))
 
 (defn exists?
   "Is a path present?"
@@ -121,7 +124,7 @@
                 (catch [:type :jepsen.control/nonzero-exit, :exit 4] e
                   (if (pos? tries)
                     ::retry
-                    (throw e))))]
+                    (throw+ e))))]
       (if (= ::retry res)
         (recur (dec tries))
         res))))
@@ -148,11 +151,11 @@
          ; options map this check is here for backwards compatibility
          opts (if (map? opts) opts {:force? opts})]
      (when (:force? opts)
-      (exec :rm :-f filename))
+       (exec :rm :-f filename))
      (when-not (empty? (:user? opts))
-      (concat wget-opts [:--user (:user? opts) :--password (:pw? opts)])) 
+       (concat wget-opts [:--user (:user? opts) :--password (:pw? opts)]))
      (when (not (exists? filename))
-      (wget-helper! wget-opts url))
+       (wget-helper! wget-opts url))
      filename)))
 
 (def wget-cache-dir
@@ -161,8 +164,8 @@
 
 (defn encode
   "base64 encode a given string and return the encoded string in utf8"
-  [s]
-  (String. (b64/encode (.getBytes s)) "UTF-8"))
+  [^String s]
+  (String. ^bytes (b64/encode (.getBytes s)) "UTF-8"))
 
 (defn cached-wget!
   "Downloads a string URL to the Jepsen wget cache directory, and returns the
@@ -201,6 +204,9 @@
   sole top-level directory to the given dest directory. Deletes
   current contents of dest. Supports both zip files and tarballs, compressed or
   raw. Returns dest.
+
+  URLs can be HTTP, HTTPS, or file://, in which case they are interpreted as a
+  file path on the remote node.
 
   Standard practice for release tarballs is to include a single directory,
   often named something like foolib-1.2.3-amd64, with files inside it. If only
@@ -298,7 +304,7 @@
                ;| :grep pattern
                ;| :grep :-v "grep"
                ;| :awk "{print $2}"
-               :pgrep pattern
+               :pgrep :-f :--ignore-ancestors pattern
                | :xargs :--no-run-if-empty :kill (str "-" (name+ signal)))
          (catch [:type :jepsen.control/nonzero-exit, :exit 0] _
            nil)

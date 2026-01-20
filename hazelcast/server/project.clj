@@ -5,11 +5,13 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :source-paths ["src"]
   :java-source-paths ["java"]
-  :dependencies [[org.clojure/clojure "1.8.0"]
-                 [org.clojure/tools.cli "0.3.5"]
-                 [org.clojure/tools.logging "0.3.1"]
-                 [spootnik/unilog "0.7.13"]
-                 [com.hazelcast/hazelcast "3.12-BETA-1"]]
+  :dependencies [[org.clojure/clojure "1.11.1"]
+                 [org.clojure/tools.cli "1.0.219"]
+                 [org.clojure/tools.logging "1.2.4"]
+                 [spootnik/unilog "0.7.31"]
+                 [com.hazelcast/hazelcast-enterprise "5.7.0-SNAPSHOT"]]
   :profiles {:uberjar {:uberjar-name "hazelcast-server.jar"}}
   :main jepsen.hazelcast-server
-  :aot [jepsen.hazelcast-server])
+  :aot [jepsen.hazelcast-server]
+  :repositories {"hazelcast snapshot" "https://repository.hazelcast.com/snapshot/"
+                 "hazelcast release" "https://repository.hazelcast.com/release/"})

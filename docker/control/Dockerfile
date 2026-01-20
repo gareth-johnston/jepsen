@@ -1,25 +1,30 @@
-FROM debian:bullseye
-MAINTAINER jake@apache.org
+FROM jgoerzen/debian-base-minimal:bookworm as debian-addons
+FROM debian:bookworm-slim
+
+# When running locally on OSX replace the top lines with following.
+## Force x86_64 for the debian-addons stage
+#FROM --platform=linux/amd64 jgoerzen/debian-base-minimal:bookworm AS debian-addons
+#
+## Force x86_64 for the final stage
+#FROM --platform=linux/amd64 debian:bookworm-slim
+
+COPY --from=debian-addons /usr/local/preinit/ /usr/local/preinit/
+COPY --from=debian-addons /usr/local/bin/ /usr/local/bin/
+COPY --from=debian-addons /usr/local/debian-base-setup/ /usr/local/debian-base-setup/
+
+RUN run-parts --exit-on-error --verbose /usr/local/debian-base-setup
+
+ENV container=docker
+STOPSIGNAL SIGRTMIN+3
 
 ENV LEIN_ROOT true
 
 #
 # Jepsen dependencies
 #
-RUN apt-get -y -q update && \
-    apt-get install -qy openjdk-17-jdk-headless \
-    libjna-java \
-    vim \
-    emacs \
-    git \
-    htop \
-    screen \
-    pssh \
-    curl \
-    wget \
-    gnuplot \
-    graphviz \
-    dos2unix
+RUN apt-get -qy update && \
+    apt-get -qy install \
+        curl dos2unix emacs git gnuplot graphviz htop iputils-ping libjna-java openjdk-17-jdk-headless pssh screen vim wget
 
 RUN wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein && \
     mv lein /usr/bin && \
@@ -37,4 +42,4 @@ ADD ./init.sh /init.sh
 RUN dos2unix /init.sh /root/.bashrc \
     && chmod +x /init.sh
 
-CMD /init.sh
+CMD ["/init.sh"]

@@ -6,12 +6,16 @@
   NOTE: While the `simulate` function is considered stable at this point, the
   others might still be subject to change -- use with care and expect possible
   breakage in future releases."
-  (:require [jepsen.generator :as gen])
+  (:require [clojure.datafy :refer [datafy]]
+            [dom-top.core :refer [assert+]]
+            [jepsen [generator :as gen]
+                    [history :as history]]
+            [jepsen.generator.context :as ctx])
   (:import (io.lacuna.bifurcan Set)))
 
 (def default-test
   "A default test map."
-  {})
+  {:nodes ["n1" "n2"]})
 
 (defn n+nemesis-context
   "A context with n numeric worker threads and one nemesis."
@@ -28,17 +32,27 @@
   [history]
   (filter #(= :invoke (:type %)) history))
 
-(defmacro with-fixed-rand-int
-  "Rebinds rand-int to yield a deterministic series of random values.
-  Definitely not threadsafe, but fine for tests I think."
+(defmacro with-fixed-rands
+  "Rebinds rand, rand-int, and rand-nth to yield a deterministic series of
+  random values. Definitely not threadsafe, but fine for tests I think."
   [seed & body]
-  `(let [values#    (atom (gen/rand-int-seq ~seed))
-         rand-int#  (fn [limit#]
+  `(let [rand-values#     (atom (gen/rand-seq ~seed))
+         rand-int-values# (atom (gen/rand-int-seq ~seed))
+         rand#      (fn ~'rand
+                      ([]
+                       (first (swap! rand-values# next)))
+                      ([limit#]
+                       (* limit# (first (swap! rand-values# next)))))
+         rand-int#  (fn ~'rand-int [limit#]
                       (if (zero? limit#)
                         0
-                        (mod (first (swap! values# next))
-                             limit#)))]
-     (with-redefs [rand-int rand-int#]
+                        (mod (first (swap! rand-int-values# next))
+                             limit#)))
+         rand-nth#   (fn ~'rand-nth [coll#]
+                       (nth coll# (rand-int# (count coll#))))]
+     (with-redefs [rand     rand#
+                   rand-int rand-int#
+                   rand-nth rand-nth]
        ~@body)))
 
 (def rand-seed
@@ -49,11 +63,13 @@
 
 (defn simulate
   "Simulates the series of operations obtained from a generator, given a
-  function that takes a context and op and returns the completion for that op."
+  function that takes a context and op and returns the completion for that op.
+
+  Strips out op :index fields--it's generally not as useful for testing."
   ([gen complete-fn]
    (simulate default-context gen complete-fn))
   ([ctx gen complete-fn]
-   (with-fixed-rand-int rand-seed
+   (with-fixed-rands rand-seed
      (loop [ops        []
             in-flight  [] ; Kept sorted by time
             gen        (gen/validate gen)
@@ -63,7 +79,8 @@
          ; (prn :invoke invoke :in-flight in-flight)
          (if (nil? invoke)
            ; We're done
-           (into ops in-flight)
+           (->> (into ops in-flight)
+                (history/strip-indices))
 
            ; TODO: the order of updates for worker maps here isn't correct; fix
            ; it.
@@ -74,11 +91,11 @@
              ; We have an invocation that's not pending, and that invocation is
              ; before every in-flight completion
              (let [thread    (gen/process->thread ctx (:process invoke))
-                   ; Advance clock, mark thread as free
-                   ctx       (-> ctx
-                                 (update :time max (:time invoke))
-                                 (assoc :free-threads
-                                        (.remove ^Set (:free-threads ctx) thread)))
+                   ; Advance clock, mark thread as busy
+                   ctx       (ctx/busy-thread
+                               ctx
+                               (max (:time ctx) (:time invoke))
+                               thread)
                    ; Update the generator with this invocation
                    gen'      (gen/update gen' default-test ctx invoke)
                    ; Add the completion to the in-flight set
@@ -90,21 +107,19 @@
              ; We need to complete something before we can apply the next
              ; invocation.
              (let [op     (first in-flight)
-                   _      (assert op "generator pending and nothing in flight???")
+                   _      (assert+ op
+                                   {:type :generator-pending-but-nothing-in-flight
+                                    :gen gen'
+                                    :ctx (datafy ctx)})
                    thread (gen/process->thread ctx (:process op))
                    ; Advance clock, mark thread as free
-                   ctx    (-> ctx
-                              (update :time max (:time op))
-                              (assoc :free-threads
-                                     (.add ^Set (:free-threads ctx)
-                                           thread)))
+                   ctx    (ctx/free-thread ctx (:time op) thread)
                    ; Update generator with completion
                    gen'   (gen/update gen default-test ctx op)
                    ; Update worker mapping if this op crashed
                    ctx    (if (or (= :nemesis thread) (not= :info (:type op)))
                             ctx
-                            (update ctx :workers
-                                    assoc thread (gen/next-process ctx thread)))]
+                            (ctx/with-next-process ctx thread))]
                (recur (conj ops op) (rest in-flight) gen' ctx)))))))))
 
 (defn quick-ops

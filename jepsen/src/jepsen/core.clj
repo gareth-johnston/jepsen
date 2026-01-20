@@ -20,20 +20,19 @@
             [clojure.datafy :refer [datafy]]
             [dom-top.core :as dt :refer [assert+]]
             [fipp.edn :refer [pprint]]
-            [knossos.op :as op]
-            [knossos.history :as history]
-            [jepsen.util :as util :refer [with-thread-name
+            [jepsen [checker :as checker]
+                    [client :as client]
+                    [control :as control]
+                    [db :as db]
+                    [generator :as generator]
+                    [nemesis :as nemesis]
+                    [store :as store]
+                    [os :as os]
+                    [util :as util :refer [with-thread-name
                                           fcatch
                                           real-pmap
-                                          relative-time-nanos]]
-            [jepsen.os :as os]
-            [jepsen.db :as db]
-            [jepsen.control :as control]
-            [jepsen.generator :as generator]
-            [jepsen.checker :as checker]
-            [jepsen.client :as client]
-            [jepsen.nemesis :as nemesis]
-            [jepsen.store :as store]
+                                          relative-time-nanos]]]
+            [jepsen.store.format :as store.format]
             [jepsen.control.util :as cu]
             [jepsen.generator [interpreter :as gen.interpreter]]
             [slingshot.slingshot :refer [try+ throw+]])
@@ -207,8 +206,8 @@
             @nf#))))))
 
 (defn run-case!
-  "Takes a test, spawns nemesis and clients, runs the generator, and returns
-  the history."
+  "Takes a test with a store handle. Spawns nemesis and clients and runs the
+  generator. Returns test with no :generator and a completed :history."
   [test]
   (with-client+nemesis-setup-teardown [test test]
     (gen.interpreter/run! test)))
@@ -216,19 +215,16 @@
 (defn analyze!
   "After running the test and obtaining a history, we perform some
   post-processing on the history, run the checker, and write the test to disk
-  again. Takes a test map and a writer. Returns a new test with results."
-  [test writer]
+  again. Takes a test map. Returns a new test with results."
+  [test]
   (info "Analyzing...")
-  (let [; Give each op in the history a monotonically increasing index
-        test (assoc test :history (history/index (:history test)))
-        ; Run checkers
-        test (assoc test :results (checker/check-safe
-                                   (:checker test)
-                                   test
-                                   (:history test)))]
+  (let [test (assoc test :results (checker/check-safe
+                                    (:checker test)
+                                    test
+                                    (:history test)))]
     (info "Analysis complete")
     (if (:name test)
-      (store/save-2! test writer)
+      (store/save-2! test)
       test)))
 
 (defn log-results
@@ -304,11 +300,14 @@
           (store/stop-logging!))))
 
 (defn prepare-test
-  "Takes a test and ensures it has a :start-time, :concurrency, and :barrier
-  field. This operation always succeeds, and is necessary for accessing a
-  test's store directory, which depends on :start-time. You may call this
-  yourself before calling run!, if you need access to the store directory
-  outside the run! context."
+  "Takes a test and prepares it for running. Ensures it has a :start-time,
+  :concurrency, and :barrier field. Wraps its generator in a forgettable
+  reference, to prevent us from inadvertently retaining the head.
+
+  This operation always succeeds, and is necessary for accessing a test's store
+  directory, which depends on :start-time. You may call this yourself before
+  calling run!, if you need access to the store directory outside the run!
+  context."
   [test]
   (cond-> test
     (not (:start-time test)) (assoc :start-time (util/local-time))
@@ -317,34 +316,48 @@
                                  (let [c (count (:nodes test))]
                                    (if (pos? c)
                                      (CyclicBarrier. (count (:nodes test)))
-                                     ::no-barrier)))))
+                                     ::no-barrier)))
+    true (update :generator util/forgettable)))
 
 (defn run!
   "Runs a test. Tests are maps containing
 
-  :nodes      A sequence of string node names involved in the test
-  :concurrency  (optional) How many processes to run concurrently
-  :ssh        SSH credential information: a map containing...
-    :username           The username to connect with   (root)
-    :password           The password to use
-    :sudo-password      The password to use for sudo, if needed
-    :port               SSH listening port (22)
-    :private-key-path   A path to an SSH identity file (~/.ssh/id_rsa)
-    :strict-host-key-checking  Whether or not to verify host keys
-  :logging    Logging options; see jepsen.store/start-logging!
-  :os         The operating system; given by the OS protocol
-  :db         The database to configure: given by the DB protocol
-  :remote     The remote to use for control actions. Try, for example,
-              (jepsen.control.sshj/remote).
-  :client     A client for the database
-  :nemesis    A client for failures
-  :generator  A generator of operations to apply to the DB
-  :checker    Verifies that the history is valid
-  :log-files  A list of paths to logfiles/dirs which should be captured at
-              the end of the test.
-  :nonserializable-keys   A collection of top-level keys in the test which
-                          shouldn't be serialized to disk.
-  :leave-db-running? Whether to leave the DB running at the end of the test.
+    :nodes      A sequence of string node names involved in the test
+    :concurrency  (optional) How many processes to run concurrently
+    :ssh        SSH credential information: a map containing...
+      :username           The username to connect with   (root)
+      :password           The password to use
+      :sudo-password      The password to use for sudo, if needed
+      :port               SSH listening port (22)
+      :private-key-path   A path to an SSH identity file (~/.ssh/id_rsa)
+      :strict-host-key-checking  Whether or not to verify host keys
+    :logging    Logging options; see jepsen.store/start-logging!
+    :os         The operating system; given by the OS protocol
+    :db         The database to configure: given by the DB protocol
+    :remote     The remote to use for control actions. Try, for example,
+                (jepsen.control.sshj/remote).
+    :client     A client for the database
+    :nemesis    A client for failures
+    :generator  A generator of operations to apply to the DB
+    :checker    Verifies that the history is valid
+    :log-files  A list of paths to logfiles/dirs which should be captured at
+                the end of the test.
+    :nonserializable-keys   A collection of top-level keys in the test which
+                            shouldn't be serialized to disk.
+    :leave-db-running? Whether to leave the DB running at the end of the test.
+
+  Jepsen automatically adds some additional keys during the run
+
+    :start-time     When the test began
+    :history        The operations the clients and nemesis performed
+    :results        The results from the checker, once the test is completed
+
+  In addition, tests have some fields added by Jepsen which are present during
+  their execution, but not persisted.
+
+    :barrier        A CyclicBarrier, mainly used for synchronizing DB setup
+    :store          State used for reading and writing data to and from disk
+    :sessions       Connected sessions used by jepsen.control to talk to nodes
 
   Tests proceed like so:
 
@@ -376,9 +389,9 @@
   (with-thread-name "jepsen test runner"
     (let [test (prepare-test test)]
       (with-logging test
-        (store/with-writer test [writer]
+        (store/with-handle [test test]
           (let [test (if (:name test)
-                       (store/save-0! test writer)
+                       (store/save-0! test)
                        test)
                 test (with-sessions [test test]
                        ; Launch OS, DBs, evaluate test
@@ -386,16 +399,14 @@
                                     (with-db test
                                       (util/with-relative-time
                                         ; Run a single case
-                                        (let [test (-> test
-                                                       (assoc :history
-                                                              (run-case! test))
+                                        (let [test (-> (run-case! test)
                                                        ; Remove state
                                                        (dissoc :barrier
                                                                :sessions))
                                               _ (info "Run complete, writing")
                                               test (if (:name test)
-                                                     (store/save-1! test writer)
+                                                     (store/save-1! test)
                                                      test)]
                                           test))))]
-                         (analyze! test writer)))]
+                         (analyze! test)))]
             (log-results test)))))))

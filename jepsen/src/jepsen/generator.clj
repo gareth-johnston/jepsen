@@ -10,7 +10,7 @@
   - :pending if the generator doesn't know what to do yet
   - [op, gen'], where op' is the next operation this generator would like to
   execute, and `gen'` is the state of the generator that would result if `op`
-  were evaluated.
+  were evaluated. Ops must be a jepsen.history.Op.
 
   `update` allows generators to evolve as events occur--for instance, when an
   operation is invoked or completed. For instance, `update` allows a generator
@@ -254,11 +254,17 @@
   thread mappings.
 
   The standard context mappings, which are provided by Jepsen when invoking the
-  top-level generator, and can be expected by every generator, are:
+  top-level generator, and can be expected by every generator, are defined in
+  jepsen.generator.context. They include some stock fields:
 
       :time           The current Jepsen linear time, in nanoseconds
-      :free-threads   A collection of idle threads which could perform work
-      :workers        A map of thread identifiers to process identifiers
+
+  Additional fields (e.g. :threads, :free-threads, etc) are present for
+  bookkeeping, but should not be interfered with or accessed directly: contexts
+  are performance-sensitive and for optimization reasons their internal
+  structure is somewhat complex. Use the functions `all-threads`,
+  `thread->process`, `some-free-process`, etc. See jepsen.generator.context for
+  these functions, which are also imported here in jepsen.generator.
 
   ## Fetching an operation
 
@@ -321,6 +327,8 @@
   - The worker map reflects the process which that thread worker was executing
     at the time the event occurred.
 
+  See jepsen.generator.context for more.
+
   ## Default implementations
 
   Nil is a valid generator; it ignores updates and always yields nil for
@@ -374,10 +382,28 @@
             [clojure.core.reducers :as r]
             [clojure.tools.logging :refer [info warn error]]
             [clojure.pprint :as pprint :refer [pprint]]
+            [dom-top.core :refer [loopr]]
             [fipp.ednize :as fipp.ednize]
-            [jepsen [util :as util]]
+            [jepsen [history :as history]
+                    [util :as util]]
+            [jepsen.generator.context :as context]
+            [potemkin :refer [import-vars]]
             [slingshot.slingshot :refer [try+ throw+]])
-  (:import (io.lacuna.bifurcan Set)))
+  (:import (io.lacuna.bifurcan Set)
+           (java.util ArrayList)))
+
+;; These used to be a part of jepsen.generator directly, and it makes sense for
+;; users to interact with them here. For cleanliness, they actually live in
+;; jepsen.generator.context.
+(import-vars [jepsen.generator.context
+              all-processes
+              all-threads
+              context
+              free-processes
+              free-threads
+              process->thread
+              some-free-process
+              thread->process])
 
 (defprotocol Generator
   (update [gen test context event]
@@ -450,19 +476,6 @@
 
 ;; Helpers
 
-(defn context
-  "Constructs a new context from a test."
-  [test]
-  (let [threads (->> (range (:concurrency test))
-                     (cons :nemesis))
-        threads (.forked (Set/from ^Iterable threads))]
-    {:time          0
-     :free-threads  threads
-     :workers       (->> threads
-                         (c/map (partial c/repeat 2))
-                         (c/map vec)
-                         (into {}))}))
-
 (defn rand-int-seq
   "Generates a reproducible sequence of random longs, given a random seed. If
   seed is not provided, taken from (rand-int))."
@@ -471,76 +484,87 @@
    (let [gen (java.util.Random. seed)]
      (repeatedly #(.nextLong gen)))))
 
-(defn free-processes
-  "Given a context, returns a collection of processes which are not actively
-  processing invocations."
-  [context]
-  (c/map (:workers context) (:free-threads context)))
-
-(defn some-free-process
-  "Given a context, returns a random free process."
-  [context]
-  (let [free-threads ^Set (:free-threads context)
-        n                 (.size free-threads)]
-    (when-not (zero? n)
-      (let [thread (.nth free-threads (rand-int n))]
-        (get (:workers context) thread)))))
-
-(defn all-processes
-  "Given a context, returns all processes currently being executed by threads."
-  [context]
-  (vals (:workers context)))
-
-(defn ^Set free-threads
-  "Given a context, returns a collection of threads that are not actively
-  processing invocations."
-  [context]
-  (:free-threads context))
-
-(defn all-threads
-  "Given a context, returns a collection of all threads."
-  [context]
-  (keys (:workers context)))
-
-(defn process->thread
-  "Takes a context and a process, and returns the thread which is executing
-  that process."
-  [context process]
-  (->> (:workers context)
-       (keep (fn [[t p]] (when (= process p) t)))
-       first))
-
-(defn thread->process
-  "Takes a context and a thread, and returns the process this thread is
-  currently executing."
-  [context thread]
-  (get (:workers context) thread))
-
-(defn next-process
-  "When a process being executed by a thread crashes, this function returns the
-  next process for a given thread. You should probably only use this with the
-  *global* context, because it relies on the size of the `:workers` map."
-  [context thread]
-  (if (number? thread)
-    (+ (get (:workers context) thread)
-       (count (c/filter number? (all-processes context))))
-    thread))
+(defn rand-seq
+  "Generates a reproducible sequence of random doubles, given a random seed. If
+  seed is not provided, taken from (rand-int)"
+  ([] (rand-seq (rand-int Integer/MAX_VALUE)))
+  ([seed]
+   (let [gen (java.util.Random. seed)]
+     (repeatedly #(.nextDouble gen)))))
 
 ;; Generators!
 
+(defn tracking-get!
+  "Takes an ArrayList, a map, a key, and a not-found value. Reads key from
+  map, returning it or not-found. Adds the key to the list if it was in the
+  map. Yourkit led me down this path."
+  [^ArrayList read-keys m k not-found]
+  (let [v (get m k ::not-found)]
+    (if (identical? v ::not-found)
+      not-found
+      (do (.add read-keys k)
+          v))))
+
 (defn fill-in-op
-  "Takes an operation and fills in missing fields for :type, :process, and
-  :time using context. Returns :pending if no process is free."
+  "Takes an operation as a map and fills in missing fields for :type, :process,
+  and :time using context. Returns :pending if no process is free. Turns maps
+  into history Ops."
   [op ctx]
+  ; This will be both inefficient and wrong for Ops, but users shouldn't
+  ; actually be passing those to us here.
+  (assert (not (instance? jepsen.history.Op op)))
   (if-let [p (some-free-process ctx)]
     ; Automatically assign type, time, and process from the context, if not
     ; provided.
-    (persistent!
-      (cond-> (transient op)
-        (nil? (:time op))     (assoc! :time (:time ctx))
-        (nil? (:process op))  (assoc! :process p)
-        (nil? (:type op))     (assoc! :type :invoke)))
+    (let [; We want to avoid using dissoc if we can POSSIBLY avoid it, so we
+          ; keep track of the fields we've read from the op.
+          read-keys  (ArrayList. 5)
+          time       (tracking-get! read-keys op :time (:time ctx))
+          type       (tracking-get! read-keys op :type :invoke)
+          process    (tracking-get! read-keys op :process p)
+          f          (tracking-get! read-keys op :f nil)
+          value      (tracking-get! read-keys op :value nil)
+          read-count (.size read-keys)
+          ; Any other fields?
+          ext     (if (< read-count (count op))
+                    ; There's fields in the map we didn't read. Pull out the
+                    ; keys we DID read
+                    (loop [i 0, ext op]
+                      (if (= read-count i)
+                        ext
+                        (recur (inc i) (dissoc ext (.get read-keys i)))))
+                    nil)]
+      (jepsen.history.Op. -1 ; Index
+                          time
+                          type
+                          process
+                          f
+                          value
+                          nil ; meta
+                          ext))
     :pending))
+
+(defrecord Fn
+  [; We memoize the function's arity so we don't have to reflect
+   ^long arity
+   ; The function itself
+   f]
+  Generator
+  (update [this test ctx event] this)
+
+  ; When asked for an op, we invoke f to produce a generator, then exhaust that
+  ; before coming back to ourselves.
+  (op [this test ctx]
+    (when-let [gen (if (= arity 2)
+                     (f test ctx)
+                     (f))]
+      (op [gen this] test ctx))))
+
+(defn fn-wrapper
+  "Wraps a function into a wrapper which makes it more efficient to invoke. We
+  memoize the function's arity, in particular, to reduce reflection."
+  [f]
+  (Fn. (first (util/arities (class f))) f))
 
 (extend-protocol Generator
   nil
@@ -554,13 +578,11 @@
       [op (if (= :pending op) this nil)]))
 
   clojure.lang.AFunction
-  (update [f test ctx event] f)
+  (update [f test ctx event]
+    (update (fn-wrapper f) test ctx event))
 
   (op [f test ctx]
-    (when-let [x (if (= 2 (first (util/arities (class f))))
-                   (f test ctx)
-                   (f))]
-      (op [x f] test ctx)))
+    (op (fn-wrapper f) test ctx))
 
   clojure.lang.Delay
   (update [d test ctx event] d)
@@ -587,7 +609,15 @@
                 gen')]
 
           ; This generator is exhausted; move on
-          (recur (next this) test ctx))))))
+          (recur (next this) test ctx)))))
+
+  ; Forgettables are transparently unwrapped when treated as generators.
+  jepsen.util.Forgettable
+  (update [this test ctx event]
+    (update @this test ctx event))
+
+  (op [this test ctx]
+    (op @this test ctx)))
 
 (defmacro extend-protocol-runtime
   "Extends a protocol to a runtime-defined class. Helpful because some Clojure
@@ -630,8 +660,8 @@
                   (if (= :pending op)
                     []
                     (cond-> []
-                      (not (map? op))
-                      (conj "should be either :pending or a map")
+                      (not (history/op? op))
+                      (conj "should be either :pending or a jepsen.history.Op")
 
                       (not (#{:invoke :info :sleep :log} (:type op)))
                       (conj ":type should be :invoke, :info, :sleep, or :log")
@@ -642,14 +672,15 @@
                       (not (:process op))
                       (conj "no :process")
 
-                      (not-any? #{(:process op)}
-                                (free-processes ctx))
+                      (not (->> op :process
+                                (context/process->thread ctx)
+                                (context/thread-free? ctx)))
                       (conj (str "process " (pr-str (:process op))
                                  " is not free"))))))]
         (when (seq problems)
             (throw+ {:type      ::invalid-op
-                     :context   ctx
-                     ;:res       res
+                     :context   (datafy ctx)
+                     :res       res
                      :problems  problems}
                     nil
                     (with-out-str
@@ -659,7 +690,7 @@
                       (println "\nSpecifically, this is a problem because:\n")
                       (doseq [p problems]
                         (println " -" p))
-                      (println "Generator:\n")
+                      (println "\nGenerator:\n")
                       (binding [*print-length* 10]
                         (pprint gen))
                       (println "\nContext:\n")
@@ -683,14 +714,14 @@
         [op (FriendlyExceptions. gen')])
       (catch Throwable t
         (throw+ {:type    ::op-threw
-                 :context ctx}
+                 :context (datafy ctx)}
                 t
                 (with-out-str
                   (print "Generator threw" (class t) "-" (.getMessage t) "when asked for an operation. Generator:\n")
                   (binding [*print-length* 10]
                     (pprint gen))
                   (println "\nContext:\n")
-                  (pprint ctx))))))
+                  (pprint (datafy ctx)))))))
 
   (update [this test ctx event]
     (try
@@ -698,7 +729,7 @@
         (FriendlyExceptions. gen'))
       (catch Throwable t
         (throw+ {:type    ::update-threw
-                 :context ctx
+                 :context (datafy ctx)
                  :event   event}
                 t
                   (with-out-str
@@ -706,7 +737,7 @@
                     (binding [*print-length* 10]
                       (pprint gen))
                     (println "\nContext:\n")
-                    (pprint ctx)
+                    (pprint (datafy ctx))
                     (println "Event:\n")
                     (pprint event)))))))
 
@@ -785,7 +816,8 @@
   this generator does too, without calling `f`. Passes updates to underlying
   generator."
   [f gen]
-  (Map. f gen))
+  (when gen
+    (Map. f gen)))
 
 (defn f-map
   "Takes a function `f-map` converting op functions (:f op) to other functions,
@@ -842,34 +874,20 @@
   (OnUpdate. f gen))
 
 (defn on-threads-context
-  "Helper function to transform contexts for OnThreads. Takes a function which
-  returns true if a thread should be included in the context."
-  [f ctx]
-  (let [; Filter free threads to just those we want
-        ctx (assoc ctx :free-threads
-                   (.forked ^Set
-                     (reduce (fn [^Set free-threads thread]
-                               (if (f thread)
-                                 (.add free-threads thread)
-                                 free-threads))
-                             (.linear (Set.))
-                             (:free-threads ctx))))
-        ; Update workers to remove threads we won't use
-        ctx (->> (:workers ctx)
-                 (c/filter (comp f key))
-                 (into {})
-                 (assoc ctx :workers))]
-    ctx))
+  "For backwards compatibility; filters a context to just threads matching (f
+  thread). Use context/make-thread-filter for performance."
+  [f context]
+  ((context/make-thread-filter f context) context))
 
-(defrecord OnThreads [f gen]
+(defrecord OnThreads [f context-filter gen]
   Generator
   (op [this test ctx]
-    (when-let [[op gen'] (op gen test (on-threads-context f ctx))]
-      [op (OnThreads. f gen')]))
+    (when-let [[op gen'] (op gen test (context-filter ctx))]
+      [op (OnThreads. f context-filter gen')]))
 
   (update [this test ctx event]
     (if (f (process->thread ctx (:process event)))
-      (OnThreads. f (update gen test (on-threads-context f ctx) event))
+      (OnThreads. f context-filter (update gen test (context-filter ctx) event))
       this)))
 
 (defn on-threads
@@ -878,7 +896,7 @@
   generator: it will only include free threads and workers satisfying f.
   Updates are passed on only when the thread performing the update matches f."
   [f gen]
-  (OnThreads. f gen))
+  (OnThreads. f (context/make-thread-filter f) gen))
 
 (def on "For backwards compatibility" on-threads)
 
@@ -903,28 +921,30 @@
   Why is this nondeterministic? Because we use this function to decide between
   several alternative generators, and always biasing towards an earlier or
   later generator could lead to starving some threads or generators."
-  [m1 m2]
-  (condp = nil
-    m1 m2
-    m2 m1
-    (let [op1 (:op m1)
-          op2 (:op m2)]
-      (condp = :pending
-        op1 m2
-        op2 m1
-        (let [t1 (:time op1)
-              t2 (:time op2)]
-          (if (= t1 t2)
-            ; We have a tie; decide based on weights.
-            (let [w1 (:weight m1 1)
-                  w2 (:weight m2 1)
-                  w  (+ w1 w2)]
-              (assoc (if (< (rand-int w) w1) m1 m2)
-                     :weight w))
-            ; Not equal times; which comes sooner?
-            (if (< t1 t2)
-              m1
-              m2)))))))
+  ([] nil)
+  ([m] m)
+  ([m1 m2]
+   (condp identical? nil
+     m1 m2
+     m2 m1
+     (let [op1 (:op m1)
+           op2 (:op m2)]
+       (condp identical? :pending
+         op1 m2
+         op2 m1
+         (let [t1 (:time op1)
+               t2 (:time op2)]
+           (if (= t1 t2)
+             ; We have a tie; decide based on weights.
+             (let [w1 (:weight m1 1)
+                   w2 (:weight m2 1)
+                   w  (+ w1 w2)]
+               (assoc (if (< (rand-int w) w1) m1 m2)
+                      :weight w))
+             ; Not equal times; which comes sooner?
+             (if (< t1 t2)
+               m1
+               m2))))))))
 
 (defrecord Any [gens]
   Generator
@@ -952,36 +972,46 @@
     1 (first gens)
       (Any. (vec gens))))
 
-(defrecord EachThread [fresh-gen gens]
+(defn each-thread-ensure-context-filters!
+  "Ensures an EachThread has context filters for each thread."
+  [context-filters ctx]
+  (when-not (realized? context-filters)
+    (deliver context-filters
+             (reduce (fn compute-context-filters [cfs thread]
+                       (assoc cfs thread (context/make-thread-filter
+                                           #{thread}
+                                           ctx)))
+                     {}
+                     (context/all-threads ctx)))))
+
+(defrecord EachThread [fresh-gen context-filters gens]
   ; fresh-gen is a generator we use to initialize a thread's state, the first
   ; time we see it.
+  ; context-filters is a promise of a map of threads to context filters; lazily
+  ; initialized.
   ; gens is a map of threads to generators.
   Generator
   (op [this test ctx]
-    (let [free-threads (free-threads ctx)
-          all-threads  (all-threads ctx)
-          {:keys [op gen' thread] :as soonest}
-          (->> free-threads
+    (each-thread-ensure-context-filters! context-filters ctx)
+    (let [{:keys [op gen' thread] :as soonest}
+          (->> (context/free-threads ctx)
                (keep (fn [thread]
-                      (let [gen     (get gens thread fresh-gen)
-                            process (get (:workers ctx) thread)
-                            ; Give this generator a context *just* for one
-                            ; thread
-                            threads (.. (Set.)
-                                        (add thread))
-                            ctx (assoc ctx
-                                       :free-threads threads
-                                       :workers      {thread process})]
-                        (when-let [[op gen'] (op gen test ctx)]
-                          {:op      op
-                           :gen'    gen'
-                           :thread  thread}))))
+                       (let [gen     (get gens thread fresh-gen)
+                             ; Give this generator a context *just* for one
+                             ; thread
+                             ctx     ((@context-filters thread) ctx)]
+                         (when-let [[op gen'] (op gen test ctx)]
+                           {:op      op
+                            :gen'    gen'
+                            :thread  thread}))))
                (reduce soonest-op-map nil))]
       (cond ; A free thread has an operation
-            soonest [op (EachThread. fresh-gen (assoc gens thread gen'))]
+            soonest [op (EachThread. fresh-gen context-filters
+                                     (assoc gens thread gen'))]
 
             ; Some thread is busy; we can't tell what to do just yet
-            (not= (.size free-threads) (count all-threads))
+            (not= (context/free-thread-count ctx)
+                  (context/all-thread-count ctx))
             [:pending this]
 
             ; Every thread is exhausted
@@ -989,14 +1019,13 @@
             nil)))
 
   (update [this test ctx event]
+    (each-thread-ensure-context-filters! context-filters ctx)
     (let [process (:process event)
           thread (process->thread ctx process)
           gen    (get gens thread fresh-gen)
-          ctx    (-> ctx
-                     (c/update :free-threads (partial c/filter #{thread}))
-                     (assoc :workers {thread process}))
+          ctx    ((@context-filters thread) ctx)
           gen'   (update gen test ctx event)]
-      (EachThread. fresh-gen (assoc gens thread gen')))))
+      (EachThread. fresh-gen context-filters (assoc gens thread gen')))))
 
 (defn each-thread
   "Takes a generator. Constructs a generator which maintains independent copies
@@ -1004,42 +1033,116 @@
   its free process list. Updates are propagated to the generator for the thread
   which emitted the operation."
   [gen]
-  (EachThread. gen {}))
+  (EachThread. gen (promise) {}))
 
-(defrecord Reserve [ranges all-ranges gens]
+(defrecord EachProcess
+  [; A fresh copy of the generator we start with for each process
+   fresh-gen
+   ; A promise of a map of threads to the context filters for those particular
+   ; threads, lazily initialized.
+   context-filters
+   ; A map of thread -> process for processes that are currently initialized
+   ; and running
+   extant
+   ; A map of threads to generators
+   gens]
+
+  Generator
+  (op [this test ctx]
+    (each-thread-ensure-context-filters! context-filters ctx)
+    (let [{:keys [op gen' extant' thread] :as soonest}
+          (->> (context/free-threads ctx)
+               (keep (fn [thread]
+                       (let [extant-process (get extant thread ::not-found)
+                             new-process    (context/thread->process ctx thread)
+                             ; Is this a process we haven't initialized yet?
+                             new?           (not= extant-process new-process)
+                             ; Maybe inefficient--we might discard most of these
+                             extant'        (if new?
+                                              (assoc extant thread new-process)
+                                              extant)
+                             gen            (if new?
+                                              fresh-gen
+                                              (get gens thread))
+                             ; Give this generator a context *just* for one
+                             ; thread
+                             ctx     ((@context-filters thread) ctx)]
+                         ; Generate an op
+                         (when-let [[op gen'] (op gen test ctx)]
+                           {:op      op
+                            :gen'    gen'
+                            :thread  thread
+                            :extant' extant'}))))
+               (reduce soonest-op-map nil))]
+      (cond ; A free thread has an operation
+            soonest [op (EachProcess. fresh-gen context-filters extant'
+                                     (assoc gens thread gen'))]
+
+            ; Some thread is busy; we can't tell what to do just yet
+            (not= (context/free-thread-count ctx)
+                  (context/all-thread-count ctx))
+            [:pending this]
+
+            ; Every thread is exhausted
+            true
+            nil)))
+
+    (update [this test ctx event]
+    (each-thread-ensure-context-filters! context-filters ctx)
+    (let [process (:process event)
+          thread (context/process->thread ctx process)
+          gen    (get gens thread fresh-gen)
+          ctx    ((@context-filters thread) ctx)
+          gen'   (update gen test ctx event)]
+      (EachProcess. fresh-gen context-filters extant
+                    (assoc gens thread gen')))))
+
+(defn each-process
+  "Takes a generator. Constructs a generator which maintains independent copies
+  of that generator for every process. Each generator sees exactly one thread &
+  process in its free process list. Updates are propagated to the generator for
+  the thread which emitted the operation."
+  [gen]
+  (EachProcess. gen (promise) {} {}))
+
+(defrecord Reserve [ranges all-ranges context-filters gens]
   ; ranges is a collection of sets of threads engaged in each generator.
   ; all-ranges is the union of all ranges.
+  ; context-filters is a vector of context filtering functions, one for each
+  ; range (and the default gen last).
   ; gens is a vector of generators corresponding to ranges, followed by the
   ; default generator.
   Generator
   (op [_ test ctx]
-    (let [{:keys [op gen' i] :as soonest}
-          (->> ranges
-               (map-indexed
-                 (fn [i threads]
-                   (let [gen (nth gens i)
-                         ; Restrict context to this range of threads
-                         ctx (on-threads-context threads ctx)]
-                     ; Ask this range's generator for an op
-                     (when-let [[op gen'] (op gen test ctx)]
-                       ; Remember our index
-                       {:op     op
-                        :gen'   gen'
-                        :weight (count threads)
-                        :i      i}))))
-               ; And for the default generator, compute a context without any
-               ; threads from defined ranges...
-               (cons (let [ctx (on-threads-context (complement all-ranges) ctx)]
-                       ; And construct a triple for the default generator
-                       (when-let [[op gen'] (op (peek gens) test ctx)]
-                         {:op     op
-                          :gen'   gen'
-                          :weight (count (:workers ctx))
-                          :i      (count ranges)})))
-               (reduce soonest-op-map nil))]
+    (let [; A transducer to compute op/gen'/weight/i maps for each of `ranges`
+          xf (map-indexed
+               (fn per-range [i threads]
+                 (let [gen (nth gens i)
+                       ; Restrict context to this range of threads
+                       ctx ((nth context-filters i) ctx)]
+                   ; Ask this range's generator for an op
+                   (when-let [[op gen'] (op gen test ctx)]
+                     ; Remember our index
+                     {:op     op
+                      :gen'   gen'
+                      :weight (count threads)
+                      :i      i}))))
+          ; And for the default generator...
+          default-op-map
+          (let [ctx ((peek context-filters) ctx)]
+            ; And construct a triple for the default generator
+            (when-let [[op gen'] (op (peek gens) test ctx)]
+              (assert ctx)
+              {:op     op
+               :gen'   gen'
+               :weight (context/all-thread-count ctx)
+               :i      (count ranges)}))
+          ; Find soonest generator
+          {:keys [op gen' i] :as soonest}
+          (transduce xf soonest-op-map default-op-map ranges)]
       (when soonest
         ; A range has an operation to do!
-        [op (Reserve. ranges all-ranges (assoc gens i gen'))])))
+        [op (Reserve. ranges all-ranges context-filters (assoc gens i gen'))])))
 
   (update [this test ctx event]
     (let [process (:process event)
@@ -1051,7 +1154,8 @@
                         (inc i)))
                     0
                     ranges)]
-      (Reserve. ranges all-ranges (c/update gens i update test ctx event)))))
+      (Reserve. ranges all-ranges context-filters
+                (c/update gens i update test ctx event)))))
 
 (defn reserve
   "Takes a series of count, generator pairs, and a final default generator.
@@ -1074,7 +1178,10 @@
                   (partition 2)
                   ; Construct [thread-set gen] tuples defining the range of
                   ; thread indices covering a given generator, lower
-                  ; inclusive, upper exclusive.
+                  ; inclusive, upper exclusive. TODO: I think there might be a
+                  ; bug here: if we construct nested reserves or otherwise
+                  ; restrict threads, an inner reserve might not understand
+                  ; that its threads don't start at 0.
                   (reduce (fn [[n gens] [thread-count gen]]
                             (let [n' (+ n thread-count)]
                               [n' (conj gens [(set (range n n')) gen])]))
@@ -1082,11 +1189,15 @@
                   second)
         ranges      (mapv first gens)
         all-ranges  (reduce set/union ranges)
+        ; Compute context filters for all ranges
+        context-filters (mapv context/make-thread-filter
+                              (c/concat ranges
+                                      [(complement all-ranges)]))
         gens        (mapv second gens)
         default     (last args)
         gens        (conj gens default)]
     (assert default)
-    (Reserve. ranges all-ranges gens)))
+    (Reserve. ranges all-ranges context-filters gens)))
 
 (declare nemesis)
 
@@ -1097,7 +1208,7 @@
   process requesting an operation is :nemesis, routes to the nemesis generator;
   otherwise to the client generator."
   ([client-gen]
-   (on (complement #{:nemesis}) client-gen))
+   (on (context/all-but :nemesis) client-gen))
   ([client-gen nemesis-gen]
    (any (clients client-gen)
         (nemesis nemesis-gen))))
@@ -1126,7 +1237,7 @@
   ; when emitting ops.
   Generator
   (op [_ test ctx]
-    (when (seq gens)
+    (when-not (= 0 (count gens))
       (if-let [[op gen'] (op (nth gens i) test ctx)]
         ; Good, we have an op
         [op (Mix. (rand-int (count gens)) (assoc gens i gen'))]
@@ -1151,7 +1262,8 @@
   won't let other generators (which could help us get unstuck!) advance. We
   should probably cycle on :pending."
   [gens]
-  (Mix. (rand-int (count gens)) (vec gens)))
+  (when (seq gens)
+    (Mix. (rand-int (count gens)) (vec gens))))
 
 (defrecord Limit [remaining gen]
   Generator
@@ -1180,15 +1292,13 @@
   [msg]
   {:type :log, :value msg})
 
-(defrecord Repeat [remaining gen]
+(defrecord Repeat [^long remaining gen]
   ; Remaining is positive for a limit, or -1 for infinite repeats.
   Generator
   (op [_ test ctx]
-    (when-not (zero? remaining)
+    (when-not (= 0 remaining)
       (when-let [[op gen'] (op gen test ctx)]
-        ; If you actually hit MIN_INT doing this... you probably have bigger
-        ; problems on your hands.
-        [op (Repeat. (dec remaining) gen)])))
+        [op (Repeat. (max -1 (dec remaining)) gen)])))
 
   (update [this test ctx event]
     (Repeat. remaining (update gen test ctx event))))
@@ -1263,6 +1373,27 @@
   continue to perform ops, rather than the full concurrency of the test."
   [n gen]
   (ProcessLimit. n #{} gen))
+
+
+(defrecord ConcurrencyLimit [n gen]
+  Generator
+  (op [this test ctx]
+    (if (< (- (context/all-thread-count ctx)
+              (context/free-thread-count ctx))
+           n)
+      (when-let [[op gen'] (op gen test ctx)]
+        [op (ConcurrencyLimit. n gen')])
+      [:pending this]))
+
+  (update [this test ctx event]
+    (ConcurrencyLimit. n (update gen test ctx event))))
+
+(defn concurrency-limit
+  "Limits the number of concurrent operations performed by a generator to at
+  most n. This generator returns :pending whenever there are n or more threads
+  busy."
+  [n gen]
+  (ConcurrencyLimit. n gen))
 
 (defrecord TimeLimit [limit cutoff gen]
   Generator
@@ -1403,16 +1534,12 @@
 (defrecord Synchronize [gen]
   Generator
   (op [this test ctx]
-    (let [free (free-threads ctx)
-          all  (all-threads ctx)]
-      (if (and (= (.size free)
-                  (count all))
-               (= (set free)
-                  (set all)))
-        ; We're ready, replace ourselves with the generator
-        (op gen test ctx)
-        ; Not yet
-        [:pending this])))
+    (if (= (context/free-thread-count ctx)
+           (context/all-thread-count ctx))
+      ; We're ready, replace ourselves with the generator
+      (op gen test ctx)
+      ; Not yet
+      [:pending this]))
 
   (update [_ test ctx event]
     (Synchronize. (update gen test ctx event))))

@@ -23,17 +23,26 @@
   ; 74.125.239.39   STREAM host.com
   ; 74.125.239.39   DGRAM
   ; ...
-  (let [res (c/exec :getent :ahosts host)
+  (let [res (c/exec :getent :ahostsv4 host)
         ip (first (str/split (->> res
                                   (str/split-lines)
                                   (first))
                              #"\s+"))]
-    (when (str/blank? ip)
-      ; We get this occasionally for reasons I don't understand
-      (throw+ {:type    :blank-getent-ip
-               :output  res
-               :host    host}))
-    ip))
+    (cond ; Debian Bookworm seems to have changed getent ahosts to return
+          ; loopback IPs instead of public ones; when this happens, we fall
+          ; back to local-ip.
+          (re-find #"^127" ip)
+          (local-ip)
+
+          ; We get this occasionally for reasons I don't understand
+          (str/blank? ip)
+          (throw+ {:type    :blank-getent-ip
+                   :output  res
+                   :host    host})
+
+          ; Valid IP
+          true
+          ip)))
 
 (def ip
   "Look up an ip for a hostname. Memoized."

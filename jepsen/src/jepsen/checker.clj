@@ -2,6 +2,8 @@
   "Validates that a history is correct with respect to some model."
   (:refer-clojure :exclude [set])
   (:require [clojure [core :as c]
+                     [datafy :refer [datafy]]
+                     [pprint :refer [pprint]]
                      [set :as set]
                      [stacktrace :as trace]
                      [string :as str]]
@@ -9,11 +11,14 @@
             [clojure.java [io :as io]
                           [shell :refer [sh]]]
             [clojure.tools.logging :refer [info warn]]
+            [dom-top.core :as dt :refer [loopr]]
             [potemkin :refer [definterface+]]
-            [jepsen.util :as util :refer [meh fraction map-kv]]
-            [jepsen.store :as store]
+            [jepsen [history :as h]
+                    [store :as store]
+                    [util :as util :refer [meh fraction map-kv]]]
             [jepsen.checker [perf :as perf]
                             [clock :as clock]]
+            [jepsen.history.fold :as f]
             [multiset.core :as multiset]
             [gnuplot.core :as g]
             [knossos [model :as model]
@@ -23,7 +28,8 @@
                      [wgl :as wgl]
                      [history :as history]]
             [knossos.linear.report :as linear.report]
-            [slingshot.slingshot :refer [try+ throw+]])
+            [slingshot.slingshot :refer [try+ throw+]]
+            [tesser.core :as t])
   (:import (java.util.concurrent Semaphore)))
 
 (def valid-priorities
@@ -74,7 +80,8 @@
 (defn check-safe
   "Like check, but wraps exceptions up and returns them as a map like
 
-  {:valid? :unknown :error \"...\"}"
+      {:valid? :unknown
+       :error {:via [{:type clojure.lang.Exceptioninfo, ...}] ...}"
   ([checker test history]
    (check-safe checker test history {}))
   ([checker test history opts]
@@ -82,7 +89,7 @@
         (catch Exception t
           (warn t "Error while checking history:")
           {:valid? :unknown
-           :error (with-out-str (trace/print-cause-trace t))}))))
+           :error (datafy t)}))))
 
 (defn compose
   "Takes a map of names to checkers, and returns a checker which runs each
@@ -131,11 +138,12 @@
   []
   (reify Checker
     (check [this test history opts]
-      (let [exes (->> history
-                      (filter :exception)
-                      (filter #(= :info (:type %)))
+      (let [exes (->> (t/filter h/info?)
+                      (t/filter :exception)
                       ; TODO: do we want the first or last :via?
-                      (group-by (comp :type first :via :exception))
+                      (t/group-by (comp :type first :via :exception))
+                      (t/into [])
+                      (h/tesser history)
                       vals
                       (sort-by count)
                       reverse
@@ -150,18 +158,29 @@
            :exceptions  exes}
           {:valid? true})))))
 
-(defn stats-
-  "Helper for computing stats; takes a history (or a subset of a history), and
-  computes a map of statistics for it."
-  [history]
-  (let [ok-count    (count (filter op/ok? history))
-        fail-count  (count (filter op/fail? history))
-        info-count  (count (filter op/info? history))]
-    {:valid?      (pos? ok-count)
-     :count       (+ ok-count fail-count info-count)
-     :ok-count    ok-count
-     :fail-count  fail-count
-     :info-count  info-count}))
+(def stats-fold
+  "Helper for computing stats over a history or filtered history."
+  (f/loopf {:name :stats}
+           ; Reduce
+           ([^long oks   0
+             ^long infos 0
+             ^long fails 0]
+            [{:keys [type]}]
+            (case type
+              :ok   (recur (inc oks) infos fails)
+              :info (recur oks (inc infos) fails)
+              :fail (recur oks infos (inc fails))))
+           ; Combine
+           ([oks 0, infos 0, fails 0]
+            [[oks' infos' fails']]
+            (recur (+ oks oks')
+                   (+ infos infos')
+                   (+ fails fails'))
+            {:valid?     (pos? oks)
+             :count      (+ oks fails infos)
+             :ok-count   oks
+             :fail-count fails
+             :info-count infos})))
 
 (defn stats
   "Computes basic statistics about success and failure rates, both overall and
@@ -171,16 +190,16 @@
   (reify Checker
     (check [this test history opts]
       (let [history (->> history
-                         (remove op/invoke?)
-                         (remove (comp #{:nemesis} :process)))
-            groups (->> history
-                        (group-by :f)
-                        (map (fn [[f subhistory]]
-                               [f (stats- subhistory)]))
-                        (into (sorted-map)))]
-        (assoc (stats- history)
-               :by-f    groups
-               :valid?  (merge-valid (map :valid? (vals groups))))))))
+                         (h/remove h/invoke?)
+                         h/client-ops)
+            {:keys [all by-f]}
+            (->> (t/fuse {:all (t/fold stats-fold)
+                          :by-f (->> (t/group-by :f)
+                                     (t/fold stats-fold))})
+                 (h/tesser history))]
+        (assoc all
+               :by-f    (into (sorted-map) by-f)
+               :valid?  (merge-valid (map :valid? (vals by-f))))))))
 
 (defn linearizable
   "Validates linearizability with Knossos. Defaults to the competition checker,
@@ -225,10 +244,10 @@
   (reify Checker
     (check [this test history opts]
       (let [final (->> history
-                       (r/filter (fn select [op]
+                       (h/filter (fn select [op]
                                    (condp = (:f op)
-                                     :enqueue (op/invoke? op)
-                                     :dequeue (op/ok? op)
+                                     :enqueue (h/invoke? op)
+                                     :dequeue (h/ok? op)
                                      false)))
                        (reduce model/step model))]
         (if (model/inconsistent? final)
@@ -244,21 +263,30 @@
   []
   (reify Checker
     (check [this test history opts]
-      (let [attempts (->> history
-                          (r/filter op/invoke?)
-                          (r/filter #(= :add (:f %)))
-                          (r/map :value)
-                          (into #{}))
-            adds (->> history
-                      (r/filter op/ok?)
-                      (r/filter #(= :add (:f %)))
-                      (r/map :value)
-                      (into #{}))
-            final-read (->> history
-                            (r/filter op/ok?)
-                            (r/filter #(= :read (:f %)))
-                            (r/map :value)
-                            (reduce (fn [_ x] x) nil))]
+      ; This would be more efficient as a single fused fold, but I'm doing it
+      ; this way to exercise/demonstrate the task system. Will replace later
+      ; once profiling shows it as a bottleneck.
+      (let [attempts (h/task history attempts []
+                             (->> (t/filter h/invoke?)
+                                  (t/filter (h/has-f? :add))
+                                  (t/map :value)
+                                  (t/set)
+                                  (h/tesser history)))
+            adds (h/task history adds []
+                         (->> (t/filter h/ok?)
+                              (t/filter (h/has-f? :add))
+                              (t/map :value)
+                              (t/set)
+                              (h/tesser history)))
+            final-read (h/task history final-reads []
+                               (->> (t/filter (h/has-f? :read))
+                                    (t/filter h/ok?)
+                                    (t/map :value)
+                                    (t/last)
+                                    (h/tesser history)))
+            attempts   @attempts
+            adds       @adds
+            final-read @final-read]
         (if-not final-read
           {:valid? :unknown
            :error  "Set was never read"}
@@ -535,34 +563,29 @@
   ([checker-opts]
   (reify Checker
     (check [this test history opts]
-      ; Build up a map of elements to element states. We track the current set
-      ; of ongoing reads as well, so we can map completions back to
-      ; invocations. Finally we track a map of duplicates: elements to maximum
-      ; multiplicities for that element in any given read.
-      (let [[elements reads dups]
+      ; Build up a map of elements to element states. Finally we track a map of
+      ; duplicates: elements to maximum multiplicities for that element in any
+      ; given read.
+      (let [[elements dups]
             (->> history
-                 (r/filter (comp number? :process)) ; Ignore the nemesis
-                 (reduce (fn red [[elements reads dups] op]
+                 h/client-ops
+                 (reduce (fn red [[elements dups] op]
                            (let [v (:value op)
                                  p (:process op)]
                              (condp = (:f op)
                                :add
                                (if (= :invoke (:type op))
                                  ; Track a new element
-                                 [(assoc elements v (set-full-element op))
-                                  reads dups]
+                                 [(assoc elements v (set-full-element op)) dups]
                                  ; Oh good, it completed
-                                 [(update elements v set-full-add op)
-                                  reads dups])
+                                 [(update elements v set-full-add op) dups])
 
                                :read
-                               (condp = (:type op)
-                                 :invoke [elements (assoc reads p op) dups]
-                                 :fail   [elements (dissoc reads p op) dups]
-                                 :info   [elements reads dups]
-                                 :ok
+                               (if-not (h/ok? op)
+                                 ; Nothing doing
+                                 [elements dups]
                                  ; We read stuff! Update every element
-                                 (let [inv (get reads (:process op))
+                                 (let [inv (h/invocation history op)
                                        ; Find duplicates
                                        dups' (->> (frequencies v)
                                                   (reduce (fn [m [k v]]
@@ -581,9 +604,8 @@
                                                  (set-full-read-absent
                                                    state inv op))])
                                             elements)
-                                    reads
                                     dups'])))))
-                         [{} {} {}]))
+                         [{} {}]))
             set-results (set-full-results checker-opts
                                           (mapv val (sort elements)))]
         (assoc set-results
@@ -592,38 +614,38 @@
                :duplicated       dups))))))
 
 (defn expand-queue-drain-ops
-  "Takes a history. Looks for :drain operations with their value being a
+  "A Tesser fold which looks for :drain operations with their value being a
   collection of queue elements, and expands them to a sequence of :dequeue
   invoke/complete pairs."
-  [history]
-  (reduce (fn [h' op]
-            (cond ; Anything other than a drain op passes through
-                  (not= :drain (:f op)) (conj h' op)
+  []
+  (t/mapcat (fn expand [op]
+              (cond ; Pass through anything other than a :drain
+                    (not= :drain (:f op)) [op]
 
-                  ; Skip drain invocations and failures
-                  (op/invoke? op) h'
-                  (op/fail? op)   h'
+                    ; Skip drain invokes/fails
+                    (h/invoke? op) nil
+                    (h/fail? op) nil
 
-                  ; For successful drains, expand
-                  (op/ok? op)
-                  (into h' (mapcat (fn [element]
-                                     [(assoc op
-                                             :type  :invoke
-                                             :f     :dequeue
-                                             :value nil)
-                                      (assoc op
-                                             :type  :ok
-                                             :f     :dequeue
-                                             :value element)])
-                                   (:value op)))
+                    ; Expand successful drains
+                    (h/ok? op)
+                    (mapcat (fn [element]
+                              [(assoc op
+                                      :index -1
+                                      :type  :invoke
+                                      :f     :dequeue
+                                      :value nil)
+                               (assoc op
+                                      :index -1
+                                      :type  :ok
+                                      :f     :dequeue
+                                      :value element)])
+                            (:value op))
 
-                  ; Anything else (e.g. crashed drains) is illegal
-                  true
-                  (throw (IllegalStateException.
-                           (str "Not sure how to handle a crashed drain operation: "
-                                (pr-str op))))))
-          []
-          history))
+                    ; Anything else (e.g. crashed drains) is illegal
+                    true
+                    (throw (IllegalStateException.
+                             (str "Not sure how to handle a crashed drain operation: "
+                                  (pr-str op))))))))
 
 (defn total-queue
   "What goes in *must* come out. Verifies that every successful enqueue has a
@@ -632,22 +654,23 @@
   []
   (reify Checker
     (check [this test history opts]
-      (let [history  (expand-queue-drain-ops history)
-            attempts (->> history
-                          (r/filter op/invoke?)
-                          (r/filter #(= :enqueue (:f %)))
-                          (r/map :value)
-                          (into (multiset/multiset)))
-            enqueues (->> history
-                          (r/filter op/ok?)
-                          (r/filter #(= :enqueue (:f %)))
-                          (r/map :value)
-                          (into (multiset/multiset)))
-            dequeues (->> history
-                          (r/filter op/ok?)
-                          (r/filter #(= :dequeue (:f %)))
-                          (r/map :value)
-                          (into (multiset/multiset)))
+      (let [{:keys [attempts enqueues dequeues]}
+            (->> (expand-queue-drain-ops)
+                 (t/fuse
+                   {:attempts (->> (t/filter (h/has-f? :enqueue))
+                                   (t/filter h/invoke?)
+                                   (t/map :value)
+                                   (t/into (multiset/multiset)))
+                    :enqueues (->> (t/filter (h/has-f? :enqueue))
+                                   (t/filter h/ok?)
+                                   (t/map :value)
+                                   (t/into (multiset/multiset)))
+                    :dequeues (->> (t/filter (h/has-f? :dequeue))
+                                   (t/filter h/ok?)
+                                   (t/map :value)
+                                   (t/into (multiset/multiset)))})
+                 (h/tesser history))
+
             ; The OK set is every dequeue which we attempted.
             ok         (multiset/intersect dequeues attempts)
 
@@ -701,38 +724,29 @@
   []
   (reify Checker
     (check [this test history opts]
-      (let [attempted-count (->> history
-                                 (filter op/invoke?)
-                                 (filter #(= :generate (:f %)))
-                                 count)
-            acks     (->> history
-                          (filter op/ok?)
-                          (filter #(= :generate (:f %)))
-                          (map :value))
-            dups     (->> acks
-                          (reduce (fn [counts id]
-                               (assoc counts id
-                                      (inc (get counts id 0))))
-                             {})
-                          (filter #(< 1 (val %)))
-                          (into (sorted-map)))
-            range    (reduce (fn [[lowest highest :as pair] id]
-                               (cond (util/compare< id lowest)  [id highest]
-                                     (util/compare< highest id) [lowest id]
-                                     true           pair))
-                             [(first acks) (first acks)]
-                             acks)]
+      (let [{:keys [attempted-count acks]}
+            (->> (t/filter (h/has-f? :generate))
+                 (t/fuse {:attempted-count (->> (t/filter h/invoke?)
+                                                (t/count))
+                          :acks (->> (t/filter h/ok?)
+                                     (t/map :value)
+                                     (t/fuse {:count (t/count)
+                                              :freqs (t/frequencies)
+                                              :range (t/range)}))})
+                 (h/tesser history))
+            dups (->> acks :freqs
+                      (r/filter #(< 1 (val %)))
+                      (into (sorted-map)))]
         {:valid?              (empty? dups)
          :attempted-count     attempted-count
-         :acknowledged-count  (count acks)
+         :acknowledged-count  (:count acks)
          :duplicated-count    (count dups)
          :duplicated          (->> dups
                                    (sort-by val)
                                    (reverse)
                                    (take 48)
                                    (into (sorted-map)))
-         :range               range}))))
-
+         :range               (:range acks)}))))
 
 (defn counter
   "A counter starts at zero; add operations should increment it by that much,
@@ -745,54 +759,66 @@
 
   Returns a map:
 
-  {:valid?              Whether the counter remained within bounds
-   :reads               [[lower-bound read-value upper-bound] ...]
-   :errors              [[lower-bound read-value upper-bound] ...]
-   :max-absolute-error  The [lower read upper] where read falls furthest outside
-   :max-relative-error  Same, but with error computed as a fraction of the mean}
+    :valid?              Whether the counter remained within bounds
+    :reads               [[lower-bound read-value upper-bound] ...]
+    :errors              [[lower-bound read-value upper-bound] ...]
+
+  ; Not implemented, but might be nice:
+
+    :max-absolute-error The [lower read upper] where read falls furthest outside
+    :max-relative-error Same, but with error computed as a fraction of the mean}
   "
   []
   (reify Checker
     (check [this test history opts]
       ; pre-process our history so failed adds do not get applied
-      (loop [history         (->> history
-                                  history/complete
-                                  (remove :fails?)
-                                  (remove op/fail?)
-                                  seq)
-             lower              0             ; Current lower bound on counter
-             upper              0             ; Upper bound on counter value
-             pending-reads      {}            ; Process ID -> [lower read-val]
-             reads              []]           ; Completed [lower val upper]s
-          (if (nil? history)
-            ; We're done here
-            (let [errors (remove (partial apply <=) reads)]
-              {:valid?             (empty? errors)
-               :reads              reads
-               :errors             errors})
-            ; But wait, there's more
-            (let [op      (first history)
-                  history (next history)]
-              (case [(:type op) (:f op)]
-                [:invoke :read]
-                (recur history lower upper
-                       (assoc pending-reads (:process op) [lower (:value op)])
-                       reads)
+      (loopr [lower              0   ; Current lower bound on counter
+              upper              0   ; Upper bound on counter value
+              pending-reads      {}  ; Process ID -> [lower read-val]
+              reads              []] ; Completed [lower val upper]s
+             ; If this is slow, maybe try :via :reduce?
+             [{:keys [process type f process value] :as op} history]
+             (case [type f]
+               [:invoke :read]
+               ; What value will this read?
+               (if-let [completion (h/completion history op)]
+                 (do (if (h/ok? completion)
+                       ; We're going to read something
+                       (recur lower upper
+                              (assoc pending-reads process
+                                     [lower (:value completion)])
+                              reads)
+                       ; Won't read anything
+                       (recur lower upper pending-reads reads)))
+                 ; Doesn't finish at all
+                 (recur lower upper pending-reads reads))
 
-                [:ok :read]
-                (let [r (get pending-reads (:process op))]
-                  (recur history lower upper
-                         (dissoc pending-reads (:process op))
-                         (conj reads (conj r upper))))
+               [:ok :read]
+               (let [r (get pending-reads process)]
+                 (recur lower upper
+                        (dissoc pending-reads process)
+                        (conj reads (conj r upper))))
 
-                [:invoke :add]
-                (do (assert (not (neg? (:value op))))
-                    (recur history lower (+ upper (:value op)) pending-reads reads))
+               [:invoke :add]
+               (do (assert (not (neg? value)))
+                   ; Look forward to find out if we'll succeed
+                   (if-let [completion (h/completion history op)]
+                     (if (h/fail? completion)
+                       ; Won't complete
+                       (recur lower upper pending-reads reads)
+                       ; Will complete
+                       (recur lower (+ upper value) pending-reads reads))
+                     ; Not sure
+                     (recur lower (+ upper value) pending-reads reads)))
 
-                [:ok :add]
-                (recur history (+ lower (:value op)) upper pending-reads reads)
+               [:ok :add]
+               (recur (+ lower value) upper pending-reads reads)
 
-                (recur history lower upper pending-reads reads))))))))
+               (recur lower upper pending-reads reads))
+                 (let [errors (remove (partial apply <=) reads)]
+                   {:valid?             (empty? errors)
+                    :reads              reads
+                    :errors             errors})))))
 
 (defn latency-graph
   "Spits out graphs of latencies. Checker options take precedence over
@@ -844,7 +870,7 @@
   false otherwise, along with a :count of the number of matches, and a :matches
   list of maps, each with the node and matching string from the file.
 
-    (log-file-pattern-checker #\"panic: (\\w+)$\" \"db.log\")
+    (log-file-pattern #\"panic: (\\w+)$\" \"db.log\")
 
     {:valid? false
      :count  5
@@ -861,7 +887,7 @@
                                (->> (store/path test node filename)
                                     .getCanonicalPath
                                     (sh "grep" "--text" "-P" (str pattern)))]
-                           (case exit
+                           (case (long exit)
                              0 (->> out
                                     str/split-lines
                                     (map (fn [line]

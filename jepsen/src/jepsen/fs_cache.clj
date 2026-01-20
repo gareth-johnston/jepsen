@@ -53,7 +53,8 @@
   (:import (java.io File)
            (java.nio.file AtomicMoveNotSupportedException
                           StandardCopyOption
-                          Files)
+                          Files
+                          Path)
            (java.nio.file.attribute FileAttribute)))
 
 ;; Where do we store files, and how do we encode paths?
@@ -140,20 +141,22 @@
 (defn atomic-move!
   "Attempts to move a file atomically, even across filesystems."
   [^File f1 ^File f2]
-  (let [p1 (.toPath f1)
-        p2 (.toPath f2)]
+  (let [p1 ^Path (.toPath f1)
+        p2 ^Path (.toPath f2)]
     (try (Files/move p1 p2 (into-array [StandardCopyOption/ATOMIC_MOVE]))
          (catch AtomicMoveNotSupportedException _
            ; Copy to the same directory, then rename
-           (let [tmp (.resolveSibling p2 (str (.getFileName p2)
-                                              ".tmp."
-                                              ; Hopefully good enough
-                                              (System/nanoTime)))]
+           (let [tmp ^Path (.resolveSibling p2 (str (.getFileName p2)
+                                                    ".tmp."
+                                                    ; Hopefully good enough
+                                                    (System/nanoTime)))]
              (try
-               (Files/copy p1 tmp
-                           (into-array [StandardCopyOption/COPY_ATTRIBUTES]))
+               (Files/copy p1 tmp ^"[Ljava.nio.file.StandardCopyOption;"
+                           (into-array StandardCopyOption
+                                       [StandardCopyOption/COPY_ATTRIBUTES]))
                (Files/move tmp p2
-                           (into-array [StandardCopyOption/ATOMIC_MOVE]))
+                           (into-array StandardCopyOption
+                                       [StandardCopyOption/ATOMIC_MOVE]))
                (Files/deleteIfExists p1)
                (finally
                  (Files/deleteIfExists tmp))))))))
@@ -251,7 +254,7 @@
 
 (defn deploy-remote!
   "Deploys a cached path to the given remote path (a string). Deletes remote
-  path first. Creates parents if necessary."
+  path first. Creates parents if necessary. Returns remote path."
   [cache-path remote-path]
   (when-not (cached? cache-path)
     (throw (IllegalStateException. (str "Path " (pr-str cache-path) " is not cached and cannot be deployed."))))
@@ -263,7 +266,8 @@
   (c/exec :rm :-rf remote-path)
   (let [parent (.getParent (io/file remote-path))]
     (c/exec :mkdir :-p parent)
-    (c/upload (.getCanonicalPath (file cache-path)) remote-path)))
+    (c/upload (.getCanonicalPath (file cache-path)) remote-path)
+    remote-path))
 
 ;; Locks
 

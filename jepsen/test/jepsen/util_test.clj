@@ -1,7 +1,10 @@
 (ns jepsen.util-test
   (:refer-clojure :exclude [parse-long])
-  (:use clojure.test)
-  (:require [jepsen.util :refer :all]))
+  (:require [clojure [pprint :refer [pprint]]
+                     [test :refer :all]]
+            [fipp.edn :as fipp]
+            [jepsen [history :as h]
+                    [util :refer :all]]))
 
 (deftest majority-test
   (is (= 1 (majority 0)))
@@ -10,6 +13,16 @@
   (is (= 2 (majority 3)))
   (is (= 3 (majority 4)))
   (is (= 3 (majority 5))))
+
+(deftest minority-test
+  (are [expected n] (= expected (minority n))
+       0 0
+       0 1
+       0 2
+       1 3
+       1 4
+       2 5
+       2 6))
 
 (deftest integer-interval-set-str-test
   (is (= (integer-interval-set-str [])
@@ -32,27 +45,28 @@
 
 (deftest history->latencies-test
   (let [history
-        [{:time 11457033239, :process 2, :type :invoke, :f :read}
-         {:time 11457019103, :process 3, :type :invoke, :f :read}
-         {:time 11457111283, :process 4, :type :invoke, :f :cas, :value [0 2]}
-         {:time 11457094604, :process 0, :type :invoke, :f :cas, :value [4 4]}
-         {:time 11457159210, :process 1, :type :invoke, :f :cas, :value [3 1]}
-         {:value nil, :time 11473961208, :process 2, :type :ok, :f :read}
-         {:value nil, :time 11473953899, :process 3, :type :ok, :f :read}
-         {:time 11478831184, :process 4, :type :info, :f :cas, :value [0 2]}
-         {:time 11478852616, :process 1, :type :fail, :f :cas, :value [3 1]}
-         {:time 11478859479, :process 0, :type :fail, :f :cas, :value [4 4]}
-         {:time 12475010505, :process 2, :type :invoke, :f :read}
-         {:time 12475010560, :process :nem :type :info :f :hi}
-         {:time 12475232472, :process 3, :type :invoke, :f :write, :value 0}
-         {:value nil, :time 12477011002, :process 2, :type :ok, :f :read}
-         {:time 12479523408, :process 4, :type :invoke, :f :cas, :value [1 0]}
-         {:time 12479572112, :process 0, :type :invoke, :f :write, :value 1}
-         {:time 12479552107, :process 1, :type :invoke, :f :cas, :value [4 3]}
-         {:time 12480010179, :process 3, :type :ok, :f :write, :value 0}
-         {:time 12481345684, :process 1, :type :fail, :f :cas, :value [4 3]}
-         {:time 12484071466, :process 0, :type :ok, :f :write, :value 1}
-         {:time 12484388730, :process 4, :type :ok, :f :cas, :value [1 0]}]
+        (h/history
+          [{:time 11457033239, :process 2, :type :invoke, :f :read}
+           {:time 11457019103, :process 3, :type :invoke, :f :read}
+           {:time 11457111283, :process 4, :type :invoke, :f :cas, :value [0 2]}
+           {:time 11457094604, :process 0, :type :invoke, :f :cas, :value [4 4]}
+           {:time 11457159210, :process 1, :type :invoke, :f :cas, :value [3 1]}
+           {:value nil, :time 11473961208, :process 2, :type :ok, :f :read}
+           {:value nil, :time 11473953899, :process 3, :type :ok, :f :read}
+           {:time 11478831184, :process 4, :type :info, :f :cas, :value [0 2]}
+           {:time 11478852616, :process 1, :type :fail, :f :cas, :value [3 1]}
+           {:time 11478859479, :process 0, :type :fail, :f :cas, :value [4 4]}
+           {:time 12475010505, :process 2, :type :invoke, :f :read}
+           {:time 12475010560, :process :nem :type :info :f :hi}
+           {:time 12475232472, :process 3, :type :invoke, :f :write, :value 0}
+           {:value nil, :time 12477011002, :process 2, :type :ok, :f :read}
+           {:time 12479523408, :process 4, :type :invoke, :f :cas, :value [1 0]}
+           {:time 12479572112, :process 0, :type :invoke, :f :write, :value 1}
+           {:time 12479552107, :process 1, :type :invoke, :f :cas, :value [4 3]}
+           {:time 12480010179, :process 3, :type :ok, :f :write, :value 0}
+           {:time 12481345684, :process 1, :type :fail, :f :cas, :value [4 3]}
+           {:time 12484071466, :process 0, :type :ok, :f :write, :value 1}
+           {:time 12484388730, :process 4, :type :ok, :f :cas, :value [1 0]}])
         h    (history->latencies history)
         n->m (partial * 1e-6)]
     (->> h
@@ -172,3 +186,32 @@
     (is (< (* target-mean 0.7)
            mean
            (* target-mean 1.3)))))
+
+(deftest zipf-test
+  (let [n       1000
+        skew    1.00001
+        m       5
+        samples (take n (repeatedly (partial zipf skew m)))
+        f       (frequencies samples)]
+    (is (every? #(< -1 % m) samples))
+    (is (< 1.5 (/ (f 0) (f 1)) 2.5))
+    (is (< 2.5 (/ (f 0) (f 2)) 4))
+    (is (< 4   (/ (f 0) (f 4)) 6))))
+
+(deftest forgettable-test
+  (let [f (forgettable :foo)]
+    (is (= :foo @f))
+    (is (= "#<Forgettable :foo>" (str f)))
+    (is (= "#<Forgettable :foo>\n" (with-out-str (pprint f))))
+    (is (re-find #"^#object\[jepsen.util.Forgettable \"0x\w+\" :foo\]\n$"
+                 (with-out-str (fipp/pprint f))))
+    (forget! f)
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"\{:type :jepsen\.util/forgotten\}"
+                          @f))))
+
+(deftest partition-by-vec-test
+  (is (= [] (partition-by-vec first nil)))
+  (is (= [] (partition-by-vec second [])))
+  (is (= [[1] [2]] (partition-by-vec identity [1 2])))
+  (is (= [[1 2] [-1 -2] [3 3 3]] (partition-by-vec pos? [1 2 -1 -2 3 3 3]))))

@@ -1,22 +1,27 @@
 (ns jepsen.core-test
   (:refer-clojure :exclude [run!])
-  (:use clojure.test)
-  (:require [clojure.string :as str]
-            [clojure.pprint :refer [pprint]]
-            [jepsen.core :refer :all]
-            [jepsen [common-test :refer [quiet-logging]]
-                    [nemesis-test :as nemesis-test]]
-            [jepsen.os :as os]
-            [jepsen.db :as db]
-            [jepsen.tests :as tst]
-            [jepsen.control :as control]
-            [jepsen.client :as client]
-            [jepsen.generator :as gen]
-            [jepsen.store :as store]
-            [jepsen.checker :as checker]
-            [jepsen.nemesis :as nemesis]
-            [knossos [model :as model]
-                     [op :as op]]))
+  (:require [clojure [pprint :refer [pprint]]
+                     [string :as str]
+                     [test :refer :all]]
+            [dom-top.core :refer [loopr]]
+            [jepsen [checker :as checker]
+                    [client :as client]
+                    [common-test :refer [quiet-logging]]
+                    [control :as control]
+                    [core :refer :all]
+                    [db :as db]
+                    [generator :as gen]
+                    [history :as h]
+                    [nemesis :as nemesis]
+                    [nemesis-test :as nemesis-test]
+                    [os :as os]
+                    [store :as store]
+                    [tests :as tst]
+                    [util :as util]]
+            [jepsen.generator.context :as gen.ctx]
+            [jepsen.tests.cycle.append :as list-append])
+  (:import (jepsen.history IHistory
+                           Op)))
 
 (use-fixtures :once quiet-logging)
 
@@ -60,6 +65,72 @@
                     :ssh    {:dummy? true})]
     (is (thrown-with-msg? RuntimeException #"^hi$" (run! test)))))
 
+(defn list-append-test
+  "Tests a list-append workload on a simple in-memory database. Runs n ops.
+  Helpful stress & sanity test for generators, writing and reading histories,
+  and the Elle checker."
+  [n]
+  (let [state (atom {})
+        ; Takes a state, a txn, and a volatile for the completed txn to go to.
+        ; Applies txn to state, returning new state, and updating volatile.
+        apply-txn (fn apply-txn [state txn txn'-volatile]
+                    (loopr [state' (transient state)
+                            txn'  (transient [])]
+                           [[f k v :as mop] txn]
+                           (case f
+                             :r (recur state'
+                                       (conj! txn' [f k (get state' k)]))
+                             :append (recur (assoc! state' k
+                                                    (conj (get state' k []) v))
+                                            (conj! txn' mop)))
+                           (do (vreset! txn'-volatile (persistent! txn'))
+                               (persistent! state'))))
+        t1 (volatile! nil)
+        client (reify client/Client
+                 (open! [this test node] this)
+                 (setup! [this test] this)
+                 (invoke! [this test op]
+                   (let [txn' (volatile! nil)]
+                     (swap! state apply-txn (:value op) txn')
+                     (assoc op :type :ok, :value @txn')))
+                 (teardown! [this test]
+                   (vreset! t1 (System/nanoTime)))
+                 (close! [this test]))
+        test  (-> tst/noop-test
+                  (merge (list-append/test {})
+                         {:name "list-append"
+                          :client client
+                          :concurrency 100
+                          :ssh {:dummy? true}})
+                  (update :generator #(->> %
+                                           gen/clients
+                                           (gen/limit n))))
+        t0 (System/nanoTime)
+        test (run! test)
+        t1 @t1
+        t2 (System/nanoTime)
+        h (:history test)
+        r (:results test)]
+    (testing "history"
+      (is (= (* 2 n) (count h)))
+      (is (instance? IHistory h))
+      (is (instance? Op (first h))))
+    (testing "results"
+      (is (= true (:valid? r))))
+    (assoc test
+           :run-time   (double (util/nanos->secs (- t1 t0)))
+           :check-time (double (util/nanos->secs (- t2 t1))))))
+
+(deftest list-append-short-test
+  (list-append-test 100))
+
+(deftest ^:perf list-append-perf-test
+  (let [n (long 1e6)
+        {:keys [run-time check-time]} (list-append-test n)]
+    (println (format "list-append-perf-test: %d ops run in %.2f s (%.2f ops/sec); checked in %.2f s (%.2f ops/sec)"
+                     n run-time (/ n run-time)
+                     check-time (/ n check-time)))))
+
 (deftest ^:integration basic-cas-test
   (let [state (atom nil)
         meta-log (atom [])
@@ -88,8 +159,8 @@
                             (gen/nemesis {:type :info, :f :fault})))
         test     (run! test)
         h        (:history test)
-        invokes  (partial filter op/invoke?)
-        oks      (partial filter op/ok?)
+        invokes  (partial filter h/invoke?)
+        oks      (partial filter h/ok?)
         reads    (partial filter (comp #{:read} :f))
         writes   (partial filter (comp #{:write} :f))
         cases    (partial filter (comp #{:cas} :f))
@@ -238,7 +309,7 @@
                                       (gen/each-thread
                                         (gen/once
                                           (fn [test ctx]
-                                            (if (= [0] (seq (:free-threads ctx)))
+                                            (if (= [0] (seq (gen.ctx/free-threads ctx)))
                                               (/ 1 0)
                                               {:type :invoke, :f :meow}))))
                                       (gen/once {:type :invoke, :f :done})))))))

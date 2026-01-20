@@ -4,12 +4,16 @@
   (:require [clojure.data.fressian :as fress]
             [clojure.string :as str]
             [fipp.edn :refer [pprint]]
-            [jepsen.store :refer :all]
-            [jepsen [common-test :refer [quiet-logging]]]
-            [jepsen.core-test :as core-test]
-            [jepsen.core :as core]
-            [multiset.core :as multiset]
-            [jepsen.tests :refer [noop-test]])
+            [jepsen [common-test :refer [quiet-logging]]
+                    [core :as core]
+                    [core-test :as core-test]
+                    [generator :as gen]
+                    [history :as history :refer [op]]
+                    [store :refer :all]
+                    [tests :refer [noop-test]]]
+            [jepsen.store [format :as store.format]
+                          [fressian :as store.fressian]]
+            [multiset.core :as multiset])
   (:import (org.fressian.handlers WriteHandler ReadHandler)))
 
 (use-fixtures :once quiet-logging)
@@ -19,6 +23,8 @@
 (def base-test (assoc noop-test
                       :pure-generators true
                       :name     "store-test"
+                      :generator (->> [{:f :trivial}]
+                                      gen/clients)
                       :record   (Kitten. "fluffy" "smol")
                       :multiset (into (multiset/multiset)
                                       [1 1 2 3 5 8])
@@ -35,6 +41,8 @@
                       :cons     (cons 1 (cons 2 nil))
                       :set      #{1 2 3}
                       :map      {:a 1 :b 2}
+                      :ops      [(op {:time 3, :index 4, :process :nemesis, :f
+                                      :foo, :value [:hi :there]})]
                       :sorted-map (sorted-map 1 :x 2 :y)
                       :plot {:nemeses
                              #{{:name "pause pd",
@@ -47,7 +55,9 @@
   [x]
   (let [b (fress/write x :handlers write-handlers)
         ;_  (hexdump/print-dump (.array b))
-        x' (fress/read b :handlers read-handlers)]
+        x' (with-open [in (fress/to-input-stream b)
+                       r  (store.fressian/reader in)]
+             (fress/read-object r))]
     x'))
 
 (deftest fressian-test
@@ -56,19 +66,33 @@
        [#{5 6}
         #{:foo}]))
 
+(deftest fressian-vector-test
+  ; Make sure we decode these as vecs, not arraylists.
+  (is (vector? (fr [])))
+  (is (vector? (fr [1])))
+  (is (vector? (fr [:x :y])))
+  (is (vector? (:foo (fr {:foo [:x :y]})))))
+
 (deftest ^:integration roundtrip-test
   (let [name (:name base-test)
         _    (delete! name)
         t (-> base-test
               core/run!)
+        ; At this juncture we've run the test, and the history should be
+        ; written.
+        t' (load t)
+        _ (is (= (:history t) (:history t')))
+        _ (is (instance? jepsen.history.Op (first (:history t))))
+        _ (is (instance? jepsen.history.Op (first (:history t'))))
+
+        ; Now we're going to rewrite the results, adding a kitten
         [t serialized-t]
-        (with-writer t [writer]
+        (with-handle [t t]
           (let [t (-> t
-                      (save-1! writer)
                       (assoc-in [:results :kitten] (Kitten. "hi" "there"))
-                      (save-2! writer))
+                      save-2!)
                 serialized-t (dissoc t :db :os :net :client :checker :nemesis
-                                     :generator :model :remote)]
+                                     :generator :model :remote :store)]
             [t serialized-t]))
         ts        (tests name)
         [time t'] (first ts)]
@@ -77,8 +101,6 @@
 
     (testing "generic test load"
       (is (= serialized-t @t')))
-    (testing "test.fressian"
-      (is (= serialized-t (load-fressian-file (fressian-file t)))))
     (testing "test.jepsen"
       (is (= serialized-t (load-jepsen-file (jepsen-file t)))))
     (testing "load-results"

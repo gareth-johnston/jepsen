@@ -2,6 +2,7 @@
   "An sshj-backed control Remote. Experimental; I'm considering replacing
   jepsen.control's use of clj-ssh with this instead."
   (:require [byte-streams :as bs]
+            [clojure.java.io :as io]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [util :as util]]
             [jepsen.control [core :as core]
@@ -9,6 +10,7 @@
                             [scp :as scp]]
             [slingshot.slingshot :refer [try+ throw+]])
   (:import (com.jcraft.jsch.agentproxy AgentProxy
+                                       AgentProxyException
                                        ConnectorFactory)
            (com.jcraft.jsch.agentproxy.sshj AuthAgent)
            (net.schmizz.sshj SSHClient)
@@ -18,15 +20,17 @@
            (net.schmizz.sshj.connection ConnectionException)
            (net.schmizz.sshj.connection.channel OpenFailException)
            (net.schmizz.sshj.connection.channel.direct Session)
+           (net.schmizz.sshj.transport.verification PromiscuousVerifier)
            (net.schmizz.sshj.userauth UserAuthException)
            (net.schmizz.sshj.userauth.method AuthMethod)
-           (net.schmizz.sshj.xfer FileSystemFile)
+           (net.schmizz.sshj.xfer FileSystemFile
+                                  LocalDestFile)
            (java.io IOException
                     InterruptedIOException)
            (java.util.concurrent Semaphore
                                  TimeUnit)))
 
-(defn auth-methods
+(defn ^Iterable auth-methods
   "Returns a list of AuthMethods we can use for logging in via an AgentProxy."
   [^AgentProxy agent]
   (map (fn [identity]
@@ -46,15 +50,18 @@
   [^SSHClient c {:keys [username password private-key-path] :as conn-spec}]
   (or ; Try given key
       (when-let [k private-key-path]
-        (.authPublickey c username (into-array [k]))
+        (.authPublickey c ^String username
+                        ^"[Ljava.lang.String;" (into-array String [k]))
         true)
 
       ; Try agent
       (try
         (let [agent-proxy (agent-proxy)
               methods (auth-methods agent-proxy)]
-          (.auth c username methods)
+          (.auth c ^String username methods)
           true)
+        (catch AgentProxyException e
+          false)
         (catch UserAuthException e
           false))
 
@@ -65,7 +72,7 @@
              false))
 
       ; OK, standard keys didn't work, try username+password
-      (.authPassword c username password)))
+      (.authPassword c ^String username ^String password)))
 
 (defn send-eof!
   "There's a bug in SSHJ where it doesn't send an EOF when you close the
@@ -117,7 +124,9 @@
                         (if (:strict-host-key-checking conn-spec)
                           (.loadKnownHosts client)
                           (.addHostKeyVerifier client (PromiscuousVerifier.)))
-                        (.connect client (:host conn-spec) (:port conn-spec))
+                        (.connect client
+                                  ^String (:host conn-spec)
+                                  (int (:port conn-spec)))
                         (auth! client conn-spec)
                         client))]
               (assoc this
@@ -173,14 +182,16 @@
       (throw+ {:type :jepsen.control/dummy}))
     (with-errors conn-spec ctx
       (with-open [sftp (.newSFTPClient client)]
-        (.put sftp (FileSystemFile. local-paths) remote-path))))
+        (.put sftp (FileSystemFile. (io/file local-paths))
+              ^String remote-path))))
 
   (download! [this ctx remote-paths local-path _opts]
     (when (:dummy conn-spec)
       (throw+ {:type :jepsen.control/dummy}))
     (with-errors conn-spec ctx
-      (with-open [sftp (.newSFTPClient client)]
-        (.get sftp remote-paths (FileSystemFile. local-path))))))
+      (let [local-file ^LocalDestFile (FileSystemFile. (io/file local-path))]
+        (with-open [sftp (.newSFTPClient client)]
+          (.get sftp ^String remote-paths local-file))))))
 
 (def concurrency-limit
   "OpenSSH has a standard limit of 10 concurrent channels per connection.

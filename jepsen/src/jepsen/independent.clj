@@ -5,14 +5,20 @@
   namespace supports splitting a test into independent components--for example
   taking a test of a single register and lifting it to a *map* of keys to
   registers."
-  (:require [jepsen.util :as util :refer [map-kv]]
+  (:require [jepsen [history :as h]
+                    [util :as util :refer [map-kv]]]
             [jepsen.store :as store]
             [jepsen.checker :refer [merge-valid check-safe Checker]]
             [jepsen.generator :as gen]
+            [jepsen.generator.context :as ctx]
+            [jepsen.history.fold :refer [loopf]]
             [clojure.tools.logging :refer :all]
             [clojure.core.reducers :as r]
             [clojure.pprint :refer [pprint]]
-            [dom-top.core :refer [bounded-pmap]]))
+            [dom-top.core :refer [bounded-pmap loopr]])
+  (:import (io.lacuna.bifurcan IEntry IList IMap List Lists Map Maps)
+           (java.util.function BiFunction)
+           (jepsen.history Op)))
 
 (def dir
   "What directory should we write independent results to?"
@@ -48,11 +54,11 @@
 
 (defn group-threads
   "Given a group size and pure generator context, returns a collection of
-  collection of threads, each per group."
+  collections of threads, each per group."
   [n ctx]
   ; Sanity checks
   (let [group-size   n
-        thread-count (count (gen/all-threads ctx))
+        thread-count (ctx/all-thread-count ctx)
         group-count (quot thread-count group-size)]
               (assert (<= group-size thread-count)
                       (str "With " thread-count " worker threads, this"
@@ -100,24 +106,33 @@
                op))
             gen))
 
-(defrecord ConcurrentGenerator [n
-                                fgen
-                                group->threads
-                                thread->group
-                                keys
-                                gens]
-  ; n is the size of each group
-  ; fgen turns a key into a generator
-  ; group->threads is a vector mapping groups to sets of threads; lazily init.
-  ; thread->group is a map which takes threads to groups. Lazily initialized.
-  ; keys is our collection of remaining keys
-  ; gens is a vector of generators, one for each thread group.
+(defrecord ConcurrentGenerator
+  [; n is the size of each group
+   n
+   ; fgen turns a key into a generator
+   fgen
+   ; group->threads is a vector mapping groups to sets of threads; lazily init.
+   group->threads
+   ; thread->group is a map which takes threads to groups. Lazily initialized.
+   thread->group
+   ; A vector of context filters, one for each group. We use these to speed up
+   ; computing thread-restricted contexts for each group's generator. Lazily
+   ; initialized.
+   group->context-filter
+   ; keys is our collection of remaining keys
+   keys
+   ; gens is a vector of generators, one for each thread group.
+   gens]
+
   gen/Generator
   (op [this test ctx]
     ; (prn)
     ; (prn :op :=======================================)
-    (let [; Figure out our thread<->group mappings
+    (let [; Figure out our thread<->group mappings and context filters
           group->threads (or group->threads (make-group->threads n ctx))
+          group->context-filter (or group->context-filter
+                                    (mapv ctx/make-thread-filter
+                                          group->threads))
           thread->group  (or thread->group  (make-thread->group  n ctx))
           ; Lazily initialize our generators
           gens2 (or gens
@@ -156,6 +171,7 @@
             ; We have an operation to yield
             [(:op soonest)
              (ConcurrentGenerator. n fgen group->threads thread->group
+                                   group->context-filter
                                    keys (assoc gens (:group soonest)
                                                (:gen' soonest)))]
             ; We don't have an operation to yield given the current context,
@@ -163,14 +179,16 @@
             ; yield still. If there's a generator left... we're still pending.
             (when (some identity gens)
               [:pending (ConcurrentGenerator. n fgen group->threads
-                                              thread->group keys gens)]))
+                                              thread->group
+                                              group->context-filter keys
+                                              gens)]))
 
           ; OK, let's consider this group
           (let [group (first groups)
                 ; What's the generator for this group?
                 gen   (nth gens group)
                 ; We'll need a context for this group specifically
-                ctx   (gen/on-threads-context (group->threads group) ctx)
+                ctx   ((group->context-filter group) ctx)
                 ; OK, ask this gen for an op.
                 [op gen'] (gen/op gen test ctx)
                 ; If this generator is exhausted, we replace it.
@@ -205,10 +223,11 @@
   (update [this test ctx event]
     (let [process (:process event)
           thread  (gen/process->thread ctx process)
-          group   (thread->group thread)]
+          group   (thread->group thread)
+          unlifted-op (update event :value val)]
       (ConcurrentGenerator.
-        n fgen group->threads thread->group keys
-        (update gens group gen/update test ctx event)))))
+        n fgen group->threads thread->group group->context-filter keys
+        (update gens group gen/update test ctx unlifted-op)))))
 
 (defn concurrent-generator
   "Takes a positive integer n, a sequence of keys (k1 k2 ...) and a function
@@ -235,7 +254,7 @@
   ; Instead, we fold this into a custom generator.
   []
   (gen/clients
-    (ConcurrentGenerator. n fgen nil nil keys nil)))
+    (ConcurrentGenerator. n fgen nil nil nil keys nil)))
 
 (defn history-keys
   "Takes a history and returns the set of keys in it."
@@ -249,19 +268,61 @@
                (transient #{}))
        persistent!))
 
-(defn subhistory
-  "Takes a history and a key k and yields the subhistory composed of all ops in
-  history which do not have values with a differing key, unwrapping tuples to
-  their original values."
-  [k history]
-  (->> history
-       (keep (fn [op]
-               (let [v (:value op)]
-                 (cond
-                   (not (tuple? v)) op
-                   (= k (key v))    (assoc op :value (val v))
-                   true             nil))))
-       vec))
+(defn subhistories
+  "Takes a collection of keys and a history. Runs a concurrent fold over the
+  history, breaking it into a map of keys to Histories for those keys. Unwraps
+  tuples. Materializes everything in memory; later if we want to do ginormous
+  histories we should spill to disk."
+  ; We could do this in a single pass, but the bookkeeping when we don't know
+  ; the keyset up front is just exhausting. Tackle this later.
+  [ks history]
+  (let [unit (fn unit []
+               (Map/from ^java.util.Map
+                         (zipmap ks (repeatedly #(.linear (List.))))))]
+    (h/fold
+      history
+      (loopf
+        {:name :subhistories
+         :associative? true}
+        ; Reducer
+        ([^IMap subhistories (unit)]
+         [^Op op]
+         (recur
+           (let [v (.value op)]
+             (if (tuple? v)
+               ; Op belongs in a specific subhistory
+               (let [[k v]      v
+                     subhistory ^IList (.get subhistories k nil)
+                     subhistory' (.addLast subhistory
+                                           (assoc op :value v))]
+                 (.put subhistories k subhistory' Maps/MERGE_LAST_WRITE_WINS))
+
+               ; This belongs in every subhistory.
+               (loopr [^IMap subhistories' subhistories]
+                      [^IEntry ksh subhistories]
+                      (let [k                  (.key ksh)
+                            ^IList subhistory  (.value ksh)
+                            subhistory'        (.addLast subhistory op)]
+                        (recur (.put subhistories' k subhistory'
+                                     Maps/MERGE_LAST_WRITE_WINS))))))))
+        ; Combiner
+        ([^IMap shs1 (unit)]
+         [^IMap shs2]
+         (recur
+           ; Loop over new subhistory entries
+           (loopr [^IMap shs shs1]
+                  [k ks]
+                  (recur
+                    (let [sh1 (.get shs1 k nil)
+                          sh2 (.get shs2 k nil)
+                          sh  (Lists/concat sh1 sh2)]
+                      (.put shs k sh Maps/MERGE_LAST_WRITE_WINS)))))
+         ; Convert back to a Clojure map of histories.
+         (loopr [shs (transient {})]
+                [^IEntry ksh shs1]
+                (recur
+                  (assoc! shs (.key ksh) (h/history (.value ksh))))
+                (persistent! shs)))))))
 
 (defn checker
   "Takes a checker that operates on :values like `v`, and lifts it to a checker
@@ -281,12 +342,11 @@
   [checker]
   (reify Checker
     (check [this test history opts]
-      (let [ks       (history-keys history)
-            results  (->> ks
+      (let [ks            (history-keys history)
+            results  (->> (subhistories ks history)
                           (bounded-pmap
-                            (fn [k]
-                              (let [h (subhistory k history)
-                                    subdir (concat (:subdirectory opts)
+                            (fn per-subhistory [[k h]]
+                              (let [subdir (concat (:subdirectory opts)
                                                    [dir k])
                                     results (check-safe
                                               checker test h
@@ -304,7 +364,7 @@
 
                                 ; Return results as a map
                                 [k results])))
-                          (into {}))
+                          (into (sorted-map)))
             failures (->> results
                           (reduce (fn [failures [k result]]
                                     (if (:valid? result)
