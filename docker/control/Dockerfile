@@ -1,45 +1,86 @@
-FROM jgoerzen/debian-base-minimal:bookworm as debian-addons
-FROM debian:bookworm-slim
+# Use a Debian-based image with necessary tools pre-installed
+FROM jgoerzen/debian-base-standard:bookworm
 
-# When running locally on OSX replace the top lines with following.
-## Force x86_64 for the debian-addons stage
-#FROM --platform=linux/amd64 jgoerzen/debian-base-minimal:bookworm AS debian-addons
-#
-## Force x86_64 for the final stage
-#FROM --platform=linux/amd64 debian:bookworm-slim
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive \
+    container=docker \
+    LEIN_ROOT=true
 
-COPY --from=debian-addons /usr/local/preinit/ /usr/local/preinit/
-COPY --from=debian-addons /usr/local/bin/ /usr/local/bin/
-COPY --from=debian-addons /usr/local/debian-base-setup/ /usr/local/debian-base-setup/
-
-RUN run-parts --exit-on-error --verbose /usr/local/debian-base-setup
-
-ENV container=docker
 STOPSIGNAL SIGRTMIN+3
 
-ENV LEIN_ROOT true
+# Set the GITHUB_TOKEN as a build argument
+ARG GITHUB_TOKEN
+ENV GITHUB_TOKEN=${GITHUB_TOKEN}
 
-#
-# Jepsen dependencies
-#
-RUN apt-get -qy update && \
-    apt-get -qy install \
-        curl dos2unix emacs git gnuplot graphviz htop iputils-ping libjna-java openjdk-17-jdk-headless pssh screen vim wget
+# Optional branch or tag to clone (defaults to 'master')
+ARG MONOREPO_BRANCH=master
+ENV MONOREPO_BRANCH=${MONOREPO_BRANCH}
 
+# Install packages in smaller groups to manage disk space better
+RUN apt-get update && apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        wget \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/archives/*
+
+# Install development tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        dos2unix \
+        htop \
+        iputils-ping \
+        pssh \
+        screen \
+        maven \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/archives/*
+
+# Install Java and related packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libjna-java \
+        openjdk-17-jdk-headless \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/archives/*
+
+# Install larger packages separately
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        vim-tiny \
+        emacs-nox \
+        gnuplot \
+        graphviz \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/archives/*
+
+# Install Leiningen
 RUN wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein && \
     mv lein /usr/bin && \
     chmod +x /usr/bin/lein && \
     lein self-install
 
-# without --dev flag up.sh copies jepsen to these subfolders
-# with --dev flag they are empty until mounted
+# Copy and setup Jepsen
+
 COPY jepsen/jepsen /jepsen/jepsen/
-RUN if [ -f /jepsen/jepsen/project.clj ]; then cd /jepsen/jepsen && lein install; fi
+RUN if [ -f /jepsen/jepsen/project.clj ]; then \
+      cd /jepsen/jepsen && \
+      lein install && \
+      lein deps; \
+    fi
 COPY jepsen /jepsen/
 
-ADD ./bashrc /root/.bashrc
-ADD ./init.sh /init.sh
-RUN dos2unix /init.sh /root/.bashrc \
-    && chmod +x /init.sh
+# Clone and build Hazelcast Mono repository
+WORKDIR /app
+RUN git clone --depth 1 --branch "${MONOREPO_BRANCH}" https://x-access-token:${GITHUB_TOKEN}@github.com/hazelcast/hazelcast-mono.git && \
+    cd hazelcast-mono && \
+    ./mvnw clean install -DskipTests -Dcheckstyle.skip -Pquick -q -pl '!hazelcast-enterprise-extensions/hazelcast-enterprise-cdc-db2-tests' && \
+    cd .. && \
+    rm -rf hazelcast-mono
 
-CMD ["/init.sh"]
+# Setup initialization scripts
+COPY ./bashrc /root/.bashrc
+COPY ./init.sh /init.sh
+RUN dos2unix /init.sh /root/.bashrc && \
+    chmod +x /init.sh

@@ -3,10 +3,7 @@
   :url "http://jepsen.io/"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure "1.11.1"]
+  :dependencies [[org.clojure/clojure "1.12.0"]
                  [jepsen "0.3.7"]
-                 [com.hazelcast/hazelcast-enterprise "5.7.0-SNAPSHOT"]]
-  :repositories {"hazelcast snapshot" "https://repository.hazelcast.com/snapshot/"
-                 "hazelcast release" "https://repository.hazelcast.com/release/"}
-  :aot [jepsen.hazelcast]
+                 [com.hazelcast/hazelcast-enterprise "6.0.0-SNAPSHOT"]]
   :main jepsen.hazelcast)
