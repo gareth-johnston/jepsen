@@ -46,13 +46,17 @@ services:
     hostname: setup
     volumes:
       - "jepsen-shared:/var/jepsen/shared"
-    entrypoint: [ 'rm', '-rf', '/var/jepsen/shared/nodes' ] 
+    entrypoint: [ 'rm', '-rf', '/var/jepsen/shared/nodes' ]
   control:
     container_name: jepsen-control
     hostname: control
     depends_on:
 %%DEPS%%
-    build: ./control
+    build:
+      context: ./control
+      args:
+        - GITHUB_TOKEN=${GITHUB_TOKEN}
+        - MONOREPO_BRANCH=${MONOREPO_BRANCH:-master}
     env_file: ./secret/control.env
     ports:
       - "22"
