@@ -42,4 +42,13 @@ ADD ./init.sh /init.sh
 RUN dos2unix /init.sh /root/.bashrc \
     && chmod +x /init.sh
 
+<<<<<<< Updated upstream
+=======
+# Setup initialization scripts
+COPY ./bashrc /root/.bashrc
+COPY ./init.sh /init.sh
+RUN dos2unix /init.sh /root/.bashrc && \
+    chmod +x /init.sh
+
+>>>>>>> Stashed changes
 CMD ["/init.sh"]
